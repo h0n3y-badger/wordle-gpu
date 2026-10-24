@@ -48,10 +48,12 @@ private:
 		std::atomic<size_t> next{ 0 };
 		std::atomic<int> best;
 		int helpers = 0; // guarded by shared_mu_
+		int caps = -1;
 	};
 
-	// Total for guessing o.g at this node, or `best` if it can't beat best.
-	int try_option(const uint16_t * s, int n, int left, const HardRule & rule, const Opt & o, int best);
+	// Total for guessing o.g at this node, or `best` if it can't beat best. caps is
+	// km << 8 | kn for the node's CapBound, or -1.
+	int try_option(const uint16_t * s, int n, int left, const HardRule & rule, const Opt & o, int best, int caps);
 	void work_on(Shared & sh);
 	bool help(); // false if no node needs help
 

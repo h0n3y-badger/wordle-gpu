@@ -18,6 +18,73 @@ namespace {
 
 struct Cancelled {};
 
+// Lower bounds from how finely any guess can split a set. Say every candidate guess gives
+// at most km distinct feedbacks on a set U and every other allowed guess at most kn. Below
+// U (subsets of it, under hard-mode rules that only get stricter) a candidate guess still
+// gives at most km, and any other guess at most max(kn, km - 1): a word of U that is no
+// longer a candidate has lost its own all-green class. No strategy for U beats the
+// cheapest tree obeying those caps, and with h guesses left there may be none (INF).
+// It bites in hard mode: once a family like _ASTE or _IGHT has its letters fixed, its
+// words can only be tried one at a time, t(t+1)/2 guesses in total and t deep.
+struct CapBound
+{
+	static constexpr int T = 32, H = 6; // set sizes and guesses left covered
+	// root: U itself, t words, h guesses left; sub: any subset of U of t words.
+	std::vector<int> root, sub;
+	static size_t at(int h, int km, int kn, int t) { return (((size_t)h * (T + 1) + km) * (T + 1) + kn) * (T + 1) + t; }
+
+	CapBound() : root(at(H + 1, 0, 0, 0), INF), sub(at(H + 1, 0, 0, 0), INF)
+	{
+		constexpr int N = T + 1;
+		// f[h][t]: least total for t words with h guesses left, every node within the caps;
+		// q[h][x][k]: least sum of f[h] over at most k parts of x words.
+		std::vector<int> f((H + 1) * N), q((size_t)(H + 1) * N * N);
+		auto F = [&](int h, int t) { return f[h * N + t]; };
+		auto Q = [&](int h, int x, int k) {
+			if (x == 0) return 0;
+			if (h <= 0 || k <= 0) return INF;
+			return q[((size_t)h * N + x) * N + std::min(k, T)];
+		};
+		for (int km = 1; km <= T; km++)
+			for (int kn = 0; kn <= T; kn++)
+			{
+				const int cn = std::max(kn, km - 1);
+				// t words, h left: guess a candidate (it is done, the rest in at most km-1
+				// parts) or another word (2 to nmax parts).
+				auto node = [&](int h, int t, int nmax) {
+					if (t == 0) return 0;
+					if (h == 0) return INF;
+					int best = Q(h - 1, t - 1, km - 1);
+					for (int a = 1; a < t && nmax >= 2; a++) best = std::min(best, F(h - 1, a) + Q(h - 1, t - a, nmax - 1));
+					return std::min(INF, t + best);
+				};
+				for (int h = 0; h <= H; h++)
+					for (int t = 0; t <= T; t++)
+					{
+						f[h * N + t] = node(h, t, cn);
+						root[at(h, km, kn, t)] = node(h, t, kn);
+						sub[at(h, km, kn, t)] = f[h * N + t];
+						if (h == 0 || t == 0) continue;
+						int * qt = &q[((size_t)h * N + t) * N];
+						qt[0] = INF;
+						for (int k = 1; k <= T; k++)
+						{
+							// Singletons (1 each) are the cheapest split once they fit: f(a) >= 2a-1.
+							int v = k >= t ? t : qt[k - 1];
+							for (int a = 1; a <= t && k < t; a++) v = std::min(v, F(h, a) + Q(h, t - a, k - 1));
+							qt[k] = std::min(v, INF);
+						}
+					}
+			}
+	}
+};
+
+const CapBound & cap_bound()
+{
+	static const CapBound c;
+	return c;
+}
+
 // Pattern counts without clearing all 243 slots per guess.
 struct Hist
 {
@@ -304,6 +371,7 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	// one less), and each must have at least two.
 	const int lo = left == 2 ? n - 1 : std::max(1, 3 * n - 1 - beta);
 	bool settled = false;
+	int km = 0, kn = 0; // most distinct feedbacks of a candidate guess / of any other
 	auto take = [&](int g, int distinct) {
 		const int in = (int)(sc.cand[g >> 6] >> (g & 63) & 1);
 		const int lb = 3 * n - in - distinct;
@@ -315,11 +383,14 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	{
 		for (int j = 0; j < n; j++) sc.rows[j] = t.prow(s[j]);
 		const __m512i vlo = _mm512_set1_epi8((char)lo);
+		__m512i vkm = _mm512_setzero_si512(), vkn = _mm512_setzero_si512();
 		alignas(64) uint8_t c8[64];
 		for (int b = 0; b < W && !settled; b++)
 		{
 			if (!allow[b]) continue;
 			const __m512i cnt = distinct64(sc.rows, (size_t)b * 64, n, sc.buf);
+			vkm = _mm512_mask_max_epu8(vkm, allow[b] & sc.cand[b], vkm, cnt);
+			vkn = _mm512_mask_max_epu8(vkn, allow[b] & ~sc.cand[b], vkn, cnt);
 			uint64_t sel = _mm512_cmpgt_epu8_mask(cnt, vlo) & allow[b];
 			if (!sel) continue;
 			_mm512_store_si512(c8, cnt);
@@ -329,6 +400,10 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 				take(b * 64 + l, c8[l]);
 			}
 		}
+		_mm512_store_si512(c8, vkm);
+		for (int l = 0; l < 64; l++) km = std::max(km, (int)c8[l]);
+		_mm512_store_si512(c8, vkn);
+		for (int l = 0; l < 64; l++) kn = std::max(kn, (int)c8[l]);
 	}
 	else
 #endif
@@ -345,6 +420,8 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 					seen[f >> 6] |= 1ull << (f & 63);
 				}
 				const int distinct = std::popcount(seen[0]) + std::popcount(seen[1]) + std::popcount(seen[2]) + std::popcount(seen[3]);
+				int & k = sc.cand[g >> 6] >> (g & 63) & 1 ? km : kn;
+				k = std::max(k, distinct);
 				if (distinct > lo) take(g, distinct);
 			}
 	}
@@ -357,6 +434,25 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	{
 		memo_->put(key, { INF, true });
 		return INF;
+	}
+	// The caps bound may refute the node, or show it can't be done in time.
+	int caps = -1;
+	if (n <= CapBound::T && left <= CapBound::H)
+	{
+		km = std::min(km, CapBound::T);
+		kn = std::min(kn, CapBound::T);
+		const int b = cap_bound().root[CapBound::at(left, km, kn, n)];
+		if (b >= INF)
+		{
+			memo_->put(key, { INF, true });
+			return INF;
+		}
+		if (b >= beta)
+		{
+			memo_->put(key, { b, false });
+			return b;
+		}
+		caps = km << 8 | kn;
 	}
 
 	// Counting sort by bound, then non-candidates before candidates (one more group, so
@@ -375,13 +471,14 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 		for (const Opt & o : opts)
 		{
 			if (o.lb >= best) break;
-			best = std::min(best, try_option(s, n, left, rule, o, best));
+			best = std::min(best, try_option(s, n, left, rule, o, best, caps));
 		}
 	}
 	else
 	{
 		// Big node: let idle threads take options too, all pruning against one best.
 		Shared sh{ s, n, left, &rule, &opts };
+		sh.caps = caps;
 		sh.best = beta;
 		{
 			std::lock_guard<std::mutex> lock(shared_mu_);
@@ -405,7 +502,7 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	return best;
 }
 
-int ExactSolver::try_option(const uint16_t * s, int n, int left, const HardRule & rule, const Opt & o, int best)
+int ExactSolver::try_option(const uint16_t * s, int n, int left, const HardRule & rule, const Opt & o, int best, int caps)
 {
 	Hist & h = tl_hist;
 	const uint8_t * row = eng_.row(o.g);
@@ -447,23 +544,30 @@ int ExactSolver::try_option(const uint16_t * s, int n, int left, const HardRule 
 	}
 
 	// A group some candidate splits apart takes exactly 2s-1, as solve would find;
-	// any other at least 2s. That alone refutes many options.
-	int open[NPAT], nopen = 0;
+	// any other at least 2s, and at least what this node's caps allow (see CapBound).
+	// That alone refutes many options.
+	int open[NPAT], open_lb[NPAT], nopen = 0;
+	const CapBound & cb = cap_bound();
 	for (int i = 0; i < ng; i++)
 	{
 		const int size = groups[i] >> 8;
 		if (perfect_split(eng_, part + off[i], size)) { total += 2 * size - 1; rest -= 2 * size - 1; }
 		else
 		{
-			open[nopen++] = i;
-			if (total + ++rest >= best) return best;
+			int lb = 2 * size;
+			if (caps >= 0 && size <= CapBound::T) lb = std::max(lb, cb.sub[CapBound::at(left - 1, caps >> 8, caps & 255, size)]);
+			if (lb >= INF) return best;
+			open[nopen] = i;
+			open_lb[nopen++] = lb;
+			rest += lb - (2 * size - 1);
+			if (total + rest >= best) return best;
 		}
 	}
 	for (int k = 0; k < nopen; k++)
 	{
 		const int i = open[k];
 		const int size = groups[i] >> 8;
-		rest -= 2 * size;
+		rest -= open_lb[k];
 		HardRule sub = rule;
 		if (hard_) sub.add(eng_.words()[o.g].data(), groups[i] & 255);
 		total += solve(part + off[i], size, left - 1, sub, best - total - rest);
@@ -481,7 +585,7 @@ void ExactSolver::work_on(Shared & sh)
 		const int best = sh.best.load();
 		// Options are sorted by bound, so none after this one can win either.
 		if (o.lb >= best) { sh.next = count; break; }
-		const int t = try_option(sh.s, sh.n, sh.left, *sh.rule, o, best);
+		const int t = try_option(sh.s, sh.n, sh.left, *sh.rule, o, best, sh.caps);
 		for (int cur = sh.best.load(); t < cur && !sh.best.compare_exchange_weak(cur, t);) {}
 	}
 }
