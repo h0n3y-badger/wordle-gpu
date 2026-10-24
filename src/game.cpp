@@ -288,6 +288,8 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 		return [&progress, s](double f) { if (progress) progress(s, f); };
 	};
 
+	// The lookahead's per-group bounds, NPAT per guess at group_k[gk_at[guess] * NPAT].
+	std::vector<int> group_k, gk_at(eng_.num_guesses(), -1);
 	if (opt.lookahead)
 	{
 		size_t m = out.rows.size();
@@ -296,8 +298,11 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 		for (size_t i = 0; i < m; i++) g1s[i] = out.rows[i].guess;
 		const HardRule r = rule();
 		std::vector<Lookahead> la;
-		if (!eng_.lookahead(out.cands, g1s, hard_ ? &r : nullptr, la, stage_progress(LOOKAHEAD), cancel))
+		if (!eng_.lookahead(out.cands, g1s, hard_ ? &r : nullptr, la, stage_progress(LOOKAHEAD), cancel,
+				opt.exact_top > 0 || opt.exact_prove ? &group_k : nullptr))
 			return false;
+		if (!group_k.empty())
+			for (size_t i = 0; i < m; i++) gk_at[g1s[i]] = (int)i;
 		for (size_t i = 0; i < m; i++) out.rows[i].la = la[i];
 		out.have_lookahead = true;
 		sort_rows(out);
@@ -318,25 +323,48 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 		const int left = MAX_GUESSES - out.played;
 		const HardRule r = rule();
 		const size_t chunk = std::max<size_t>(8, std::thread::hardware_concurrency());
+		// Rows need exact values only while they could make the best `top` (one, to prove
+		// the best). A row whose total is at least the top-th best exact value can't, so its
+		// search stops there and what it reached becomes its bound: far cheaper than solving.
+		const size_t top = std::max(opt.exact_top, opt.exact_prove ? 1 : 0);
 		for (;;)
 		{
 			settle(out);
-			// Exact values for the best `exact_top` rows first, then (to prove the best)
-			// the unsolved rows with the lowest bounds, which come first among the unsolved.
-			std::vector<size_t> todo;
-			for (size_t i = 0; i < out.rows.size() && i < (size_t)opt.exact_top; i++)
-				if (out.rows[i].exact < 0) todo.push_back(i);
-			if (todo.empty())
+			std::vector<int> vals;
+			for (const Suggestion & s : out.rows)
+				if (s.exact >= 0) vals.push_back(s.exact);
+			int cut = INF;
+			if (vals.size() >= top)
 			{
-				if (out.proven || !opt.exact_prove) break;
-				for (size_t i = 0; i < out.rows.size() && todo.size() < chunk; i++)
-					if (out.rows[i].exact < 0) todo.push_back(i);
-				if (todo.empty()) break;
+				std::nth_element(vals.begin(), vals.begin() + (top - 1), vals.end());
+				cut = vals[top - 1];
 			}
-			std::vector<int> g1s, ex;
-			for (size_t i : todo) g1s.push_back(out.rows[i].guess);
-			const bool ok = solver.totals(out.cands, g1s, left, r, ex, stage_progress(EXACT), cancel);
-			for (size_t k = 0; k < todo.size(); k++) out.rows[todo[k]].exact = ex[k];
+			// Rows come sorted by bound. Until there are `top` exact values, solve a few
+			// exactly; refutations are quick, so then take many at a time.
+			std::vector<size_t> todo;
+			const size_t want = cut < INF ? 8 * chunk : top;
+			for (size_t i = 0; i < out.rows.size() && todo.size() < want; i++)
+				if (out.rows[i].exact < 0 && out.rows[i].la.total < cut) todo.push_back(i);
+			if (todo.empty()) break;
+			std::vector<int> g1s, ex, beta;
+			std::vector<const int *> gk;
+			for (size_t i : todo)
+			{
+				const int g = out.rows[i].guess;
+				g1s.push_back(g);
+				beta.push_back(cut);
+				gk.push_back(gk_at[g] >= 0 ? &group_k[(size_t)gk_at[g] * NPAT] : nullptr);
+			}
+			const bool ok = solver.totals(out.cands, g1s, left, r, ex, stage_progress(EXACT), cancel,
+				cut < INF ? &beta : nullptr, &gk);
+			for (size_t k = 0; k < todo.size(); k++)
+			{
+				Suggestion & s = out.rows[todo[k]];
+				if (ex[k] < 0) continue;
+				// Below the cut a total is exact; so is an impossible one.
+				if (ex[k] < cut || ex[k] >= INF) s.exact = ex[k];
+				else s.la.total = std::max(s.la.total, ex[k]);
+			}
 			settle(out);
 			if (!cache.empty()) save_cache(cache, eng_, out);
 			if (report) report(EXACT, out);

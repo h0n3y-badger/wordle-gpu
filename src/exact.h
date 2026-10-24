@@ -22,9 +22,14 @@ public:
 	// For each first guess g, the minimum total number of guesses summed over all
 	// candidates (each needing at most `left` guesses, g included), or INF.
 	// Returns false if cancelled; guesses finished before that keep their value, the rest get -1.
+	// With beta (one per guess), a guess may stop as soon as its total is known to be at
+	// least its beta: out is then exact if below beta, else a lower bound >= beta. group_k
+	// (one pointer per guess to Engine::lookahead's NPAT values, or null) gives each group
+	// its two-ply bound to start from; without it groups start at 2s-1, which prunes far less.
 	bool totals(const std::vector<uint16_t> & cands, const std::vector<int> & g1s, int left,
 		const HardRule & rule, std::vector<int> & out,
-		const std::function<void(double)> & progress = {}, const std::atomic<bool> * cancel = nullptr);
+		const std::function<void(double)> & progress = {}, const std::atomic<bool> * cancel = nullptr,
+		const std::vector<int> * beta = nullptr, const std::vector<const int *> * group_k = nullptr);
 
 	// Minimum total guesses for the candidate set, < beta, or some value >= beta.
 	int solve(const uint16_t * s, int n, int left, const HardRule & rule, int beta);

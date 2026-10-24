@@ -513,34 +513,50 @@ bool ExactSolver::help()
 
 bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<int> & g1s, int left,
 	const HardRule & rule, std::vector<int> & out,
-	const std::function<void(double)> & progress, const std::atomic<bool> * cancel)
+	const std::function<void(double)> & progress, const std::atomic<bool> * cancel,
+	const std::vector<int> * beta, const std::vector<const int *> * group_k)
 {
 	cancel_ = cancel;
 	const int n = (int)cands.size();
-	out.assign(g1s.size(), n);
 
-	struct Task { int idx; std::vector<uint16_t> set; HardRule rule; };
+	// Every group starts at a lower bound, 2s-1 or the lookahead's 3s-k; sum[i] is guess
+	// i's total with each group at its bound, or at its value once solved. Values only
+	// rise, so once sum[i] reaches beta[i] the guess is refuted and its other groups are skipped.
+	struct Task { int idx, lb; std::vector<uint16_t> set; HardRule rule; };
 	std::vector<Task> tasks;
+	std::vector<std::atomic<int>> sum(g1s.size());
 	for (size_t i = 0; i < g1s.size(); i++)
 	{
 		const int g = g1s[i];
 		const uint8_t * row = eng_.row(g);
+		const int * gk = group_k ? (*group_k)[i] : nullptr;
 		std::vector<std::vector<uint16_t>> parts(NPAT);
 		for (uint16_t c : cands) parts[row[c]].push_back(c);
+		int total = n;
 		for (int p = 0; p < ALL_GREEN; p++)
 		{
-			if (parts[p].empty()) continue;
+			const int s = (int)parts[p].size();
+			if (s == 0) continue;
+			int lb = 2 * s - 1;
+			if (gk && s >= 3 && gk[p] > 0) lb = std::max(lb, 3 * s - gk[p]);
+			total += lb;
 			HardRule sub = rule;
 			if (hard_) sub.add(eng_.words()[g].data(), p);
-			tasks.push_back({ (int)i, std::move(parts[p]), sub });
+			tasks.push_back({ (int)i, lb, std::move(parts[p]), sub });
 		}
+		sum[i] = std::min(total, INF);
 	}
-	// Big groups first so the threads finish together.
-	std::sort(tasks.begin(), tasks.end(), [](const Task & a, const Task & b) { return a.set.size() > b.set.size(); });
+	if (beta)
+		// Small groups first: they are cheap, and usually lift the total past beta (or show
+		// it impossible) before a big group has to be solved at all.
+		std::stable_sort(tasks.begin(), tasks.end(), [](const Task & a, const Task & b) { return a.set.size() < b.set.size(); });
+	else
+		// Big groups first so the threads finish together.
+		std::sort(tasks.begin(), tasks.end(), [](const Task & a, const Task & b) { return a.set.size() > b.set.size(); });
 
 	std::atomic<size_t> next{ 0 }, done{ 0 };
 	std::atomic<bool> cancelled{ false };
-	std::vector<int> results(tasks.size(), -1);
+	std::vector<char> ran(tasks.size(), 0);
 	std::mutex progress_mu;
 	auto work = [&] {
 		try
@@ -550,7 +566,21 @@ bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<
 				const size_t t = next++;
 				if (t < tasks.size())
 				{
-					results[t] = solve(tasks[t].set.data(), (int)tasks[t].set.size(), left - 1, tasks[t].rule, INF);
+					const Task & k = tasks[t];
+					std::atomic<int> & acc = sum[k.idx];
+					// The value at which this group alone would lift the total to beta.
+					int b = INF;
+					if (beta)
+					{
+						const int cur = acc.load();
+						b = cur >= (*beta)[k.idx] ? -1 : (*beta)[k.idx] - (cur - k.lb);
+					}
+					if (b >= 0)
+					{
+						const int v = solve(k.set.data(), (int)k.set.size(), left - 1, k.rule, b);
+						for (int cur = acc.load(); !acc.compare_exchange_weak(cur, std::min(INF, cur + v - k.lb));) {}
+					}
+					ran[t] = 1;
 					const size_t d = ++done;
 					if (progress)
 					{
@@ -571,11 +601,15 @@ bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<
 	for (auto & t : pool) t.join();
 	cancel_ = nullptr;
 
-	// After a cancel, guesses with every group solved still get their value.
+	// Each group either came in below its target (exact) or lifted the sum to beta, so the
+	// sum is exact below beta and a bound from there on. After a cancel, guesses with every
+	// group done, or already refuted, still get their value.
+	out.assign(g1s.size(), 0);
+	for (size_t i = 0; i < g1s.size(); i++) out[i] = sum[i].load();
 	for (size_t t = 0; t < tasks.size(); t++)
 	{
-		int & o = out[tasks[t].idx];
-		if (o >= 0) o = results[t] < 0 ? -1 : std::min(INF, o + results[t]);
+		const int i = tasks[t].idx;
+		if (!ran[t] && !(beta && out[i] >= (*beta)[i])) out[i] = -1;
 	}
 	return !cancelled;
 }

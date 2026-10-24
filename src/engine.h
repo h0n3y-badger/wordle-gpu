@@ -60,9 +60,13 @@ public:
 	// One result per first guess in g1s. Second guesses range over all words, or the
 	// ones hard mode allows after each feedback when hard is set. Returns false if
 	// cancelled. Work is split into launches of a few tens of ms so the desktop stays smooth.
+	// group_k, if given, gets NPAT values per first guess: for each feedback group of 3+
+	// candidates the best k (see Lookahead), so that group needs 3s-k more guesses; 0 for
+	// smaller groups.
 	bool lookahead(const std::vector<uint16_t> & cands, const std::vector<int> & g1s,
 		const HardRule * hard, std::vector<Lookahead> & out,
-		const std::function<void(double)> & progress = {}, const std::atomic<bool> * cancel = nullptr);
+		const std::function<void(double)> & progress = {}, const std::atomic<bool> * cancel = nullptr,
+		std::vector<int> * group_k = nullptr);
 
 private:
 	struct Device;

@@ -382,9 +382,11 @@ void Engine::stats(const std::vector<uint16_t> & cands, const std::vector<int> &
 
 bool Engine::lookahead(const std::vector<uint16_t> & cands, const std::vector<int> & g1s,
 	const HardRule * hard, std::vector<Lookahead> & out,
-	const std::function<void(double)> & progress, const std::atomic<bool> * cancel)
+	const std::function<void(double)> & progress, const std::atomic<bool> * cancel,
+	std::vector<int> * group_k)
 {
 	out.resize(g1s.size());
+	if (group_k) group_k->assign(g1s.size() * NPAT, 0);
 	if (g1s.empty() || cands.empty()) return true;
 	const int G = num_guesses(), n = (int)cands.size();
 
@@ -431,6 +433,8 @@ bool Engine::lookahead(const std::vector<uint16_t> & cands, const std::vector<in
 		lookahead_sum<<<(cnt + BD - 1) / BD, BD>>>((int)cnt, d.group_size.p, d.best_d.p, d.best_k.p, d.look.p + at);
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaEventSynchronize(d.stop));
+		if (group_k)
+			CUDA_CHECK(cudaMemcpy(group_k->data() + at * NPAT, d.best_k.p, cnt * NPAT * sizeof(int), cudaMemcpyDeviceToHost));
 		float ms = 0;
 		CUDA_CHECK(cudaEventElapsedTime(&ms, d.start, d.stop));
 		at += cnt;
