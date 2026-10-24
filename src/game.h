@@ -20,6 +20,9 @@ WordLists builtin_lists();
 // One word per line; throws on unreadable files or words that are not 5 letters a-z.
 std::vector<std::string> read_list(const std::string & path);
 
+// $XDG_CACHE_HOME/wordle-gpu or ~/.cache/wordle-gpu.
+std::string default_cache_dir();
+
 // Sorts and dedups lists.allowed; returns the indices of the possible answers in it
 // (every word when all is set). Throws if an answer is not an allowed guess.
 std::vector<int> prepare_pool(WordLists & lists, bool all);
@@ -50,6 +53,7 @@ struct Analysis
 	std::vector<Suggestion> rows;
 	bool have_lookahead = false;
 	bool proven = false;         // rows[0] is the exact optimum (by expected guesses)
+	int cached = 0;              // exact values loaded from the opener cache
 	int played = 0;              // guesses made before this one
 
 	// Expected final score (guess number the game ends on) for a suggestion.
@@ -63,6 +67,7 @@ public:
 	Game(Engine & eng, bool hard) : eng_(eng), hard_(hard) {}
 
 	Engine & engine() { return eng_; }
+	const Engine & engine() const { return eng_; }
 	bool hard() const { return hard_; }
 	const std::vector<Turn> & turns() const { return turns_; }
 	void push(int guess, uint8_t pat) { turns_.push_back({ guess, pat }); }
@@ -82,6 +87,7 @@ public:
 		int exact_top = 0;         // exact values for at least this many of the best guesses
 		bool exact_prove = false;  // keep going until the best is proven optimal
 		int threads = 0;           // exact solver threads, 0 = hardware
+		std::string cache_dir;     // where opening results are kept; empty = no cache
 	};
 	// Called after each stage with the partial result; return value unused.
 	using Report = std::function<void(Stage, const Analysis &)>;

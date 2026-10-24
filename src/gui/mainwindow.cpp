@@ -242,6 +242,7 @@ void MainWindow::analyze(bool exact)
 		opt.exact_prove = true;
 	}
 	opt.threads = std::max(1, (int)std::thread::hardware_concurrency() - 1);
+	opt.cache_dir = default_cache_dir();
 
 	exact_btn_->setEnabled(false);
 	stop_btn_->setEnabled(true);
@@ -373,8 +374,11 @@ void MainWindow::showAnalysis(std::shared_ptr<const Analysis> a, Game::Stage sta
 	{
 		int solved = 0;
 		for (const Suggestion & s : a->rows) solved += s.exact >= 0;
-		status_->setText(tr("GPU brute force %1 s, then %2 guesses solved exactly in %3 s.")
-			.arg(look_secs_, 0, 'f', 2).arg(solved).arg(secs - look_secs_, 0, 'f', 2));
+		QString t = tr("GPU brute force %1 s, then %2 guesses solved exactly")
+			.arg(look_secs_, 0, 'f', 2).arg(solved);
+		if (a->cached) t += tr(" (%1 from the opening cache)").arg(a->cached);
+		if (solved > a->cached) t += tr(" in %1 s").arg(secs - look_secs_, 0, 'f', 2);
+		status_->setText(t + '.');
 	}
 	showBreakdown();
 }

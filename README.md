@@ -19,6 +19,11 @@ answer still possible:
    remain it runs by itself and usually proves the best guess optimal in under
    a second. From the opening it takes a few minutes.
 
+The opening position is the same every game, so its exact results are kept
+in `~/.cache/wordle-gpu/` (one file per word lists, answer list and hard mode).
+After one proof run the GUI starts with the optimal opener already proven.
+`wordle-gpu-cli -C` ignores the cache.
+
 Opening result with these lists: **TARSE** is optimal at 3.4156 guesses on
 average (7907 total over the 2315 answers). Proving it took 4 min 50 s.
 
@@ -30,7 +35,10 @@ for the GUI (without Qt 6, only the CLI is built).
     cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc
     ninja -C build
 
-Other GPUs: `-DCMAKE_CUDA_ARCHITECTURES=89` (etc.).
+Other GPUs: `-DCMAKE_CUDA_ARCHITECTURES=89` (etc.). Install to `~/.local`
+(binaries plus a desktop entry):
+
+    cmake -S . -B build -DCMAKE_INSTALL_PREFIX=$HOME/.local && cmake --install build
 
 ## GUI
 

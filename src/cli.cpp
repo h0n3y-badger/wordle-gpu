@@ -20,10 +20,12 @@ static void usage(const char * argv0)
 		"  -e N        exact expected guesses for the best N\n"
 		"  -p          keep solving exactly until the best guess is proven optimal\n"
 		"  -t N        exact solver threads (default all)\n"
+		"  -C          don't read or write the opening cache (%s)\n"
 		"  -w FILE     allowed-guess list (one word per line)\n"
 		"  -A FILE     answer list\n"
 		"  -d N        CUDA device (default 0)\n"
-		"  -r          raw output: word buckets largest sum_sq entropy total by3 exact\n", argv0);
+		"  -r          raw output: word buckets largest sum_sq entropy total by3 exact\n",
+		argv0, default_cache_dir().c_str());
 }
 
 int main(int argc, char ** argv)
@@ -32,7 +34,8 @@ int main(int argc, char ** argv)
 	int show = 15, device = 0;
 	std::string allowed_path, answers_path;
 	Game::Options opt;
-	for (int c; (c = getopt(argc, argv, "Han:L:1e:pt:w:A:d:rh")) != -1;)
+	opt.cache_dir = default_cache_dir();
+	for (int c; (c = getopt(argc, argv, "Han:L:1e:pt:Cw:A:d:rh")) != -1;)
 	{
 		switch (c)
 		{
@@ -44,6 +47,7 @@ int main(int argc, char ** argv)
 			case 'e': opt.exact_top = atoi(optarg); break;
 			case 'p': opt.exact_prove = true; break;
 			case 't': opt.threads = atoi(optarg); break;
+			case 'C': opt.cache_dir.clear(); break;
 			case 'w': allowed_path = optarg; break;
 			case 'A': answers_path = optarg; break;
 			case 'd': device = atoi(optarg); break;
@@ -126,6 +130,7 @@ int main(int argc, char ** argv)
 				s.st.entropy, s.st.buckets, (double)s.st.sum_sq / n, s.st.largest);
 		}
 		if (a.proven) printf("\n%s is proven optimal.\n", eng.words()[a.rows[0].guess].c_str());
+		if (a.cached) printf("%d exact values from the opening cache.\n", a.cached);
 		printf("\n* = could be the answer. score = expected guess number the game ends on.\n");
 	}
 	catch (const std::exception & e)

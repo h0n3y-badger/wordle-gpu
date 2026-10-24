@@ -2,6 +2,9 @@
 #include "exact.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -133,6 +136,8 @@ bool better(const Analysis & a, const Suggestion & x, const Suggestion & y)
 	if (a.have_lookahead)
 	{
 		if (key(x) != key(y)) return key(x) < key(y);
+		// A proven value beats an equal lower bound.
+		if ((x.exact >= 0) != (y.exact >= 0)) return x.exact >= 0;
 		if (x.st.candidate != y.st.candidate) return x.st.candidate > y.st.candidate;
 		if (x.la.by3 != y.la.by3) return x.la.by3 > y.la.by3;
 	}
@@ -146,6 +151,77 @@ static void sort_rows(Analysis & a)
 {
 	std::stable_sort(a.rows.begin(), a.rows.end(),
 		[&](const Suggestion & x, const Suggestion & y) { return better(a, x, y); });
+}
+
+// Sort, and mark the best proven once no unsolved guess's lower bound can beat it.
+static void settle(Analysis & a)
+{
+	sort_rows(a);
+	int best = INF;
+	for (const Suggestion & s : a.rows)
+		if (s.exact >= 0) best = std::min(best, s.exact);
+	a.proven = best < INF && std::all_of(a.rows.begin(), a.rows.end(),
+		[&](const Suggestion & s) { return s.exact >= 0 || s.la.total >= best; });
+}
+
+std::string default_cache_dir()
+{
+	if (const char * x = getenv("XDG_CACHE_HOME"); x && *x) return std::string(x) + "/wordle-gpu";
+	if (const char * h = getenv("HOME"); h && *h) return std::string(h) + "/.cache/wordle-gpu";
+	return {};
+}
+
+// One file per word lists, answer list and mode.
+static std::string opener_cache(const Engine & eng, bool hard, const std::string & dir)
+{
+	if (dir.empty()) return {};
+	uint64_t h = 14695981039346656037ull; // FNV-1a
+	auto mix = [&](const void * p, size_t n) {
+		for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t *)p)[i]; h *= 1099511628211ull; }
+	};
+	const int header[] = { 1, MAX_GUESSES, hard }; // format version first
+	mix(header, sizeof header);
+	for (const auto & w : eng.words()) mix(w.data(), 5);
+	mix(eng.pool().data(), eng.pool().size() * sizeof(int));
+	char name[40];
+	snprintf(name, sizeof name, "/opener-%016llx.txt", (unsigned long long)h);
+	return dir + name;
+}
+
+// Lines are "word total", total being the exact sum of guesses over all answers.
+static bool load_cache(const std::string & path, const Game & game, Analysis & a)
+{
+	std::ifstream in(path);
+	if (!in) return false;
+	std::vector<int> exact(game.engine().num_guesses(), -1);
+	int count = 0;
+	for (std::string word; in >> word;)
+	{
+		int total;
+		if (word[0] == '#') { std::getline(in, word); continue; }
+		if (!(in >> total)) break;
+		const int g = game.find(word);
+		if (g >= 0 && total > 0) { exact[g] = total; count++; }
+	}
+	for (Suggestion & s : a.rows)
+		if (exact[s.guess] >= 0) s.exact = exact[s.guess];
+	a.cached = count;
+	return count > 0;
+}
+
+static void save_cache(const std::string & path, const Engine & eng, const Analysis & a)
+{
+	std::error_code ec;
+	std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+	const std::string tmp = path + ".tmp";
+	{
+		std::ofstream out(tmp);
+		out << "# wordle-gpu: exact total guesses over all answers for opening guesses\n";
+		for (const Suggestion & s : a.rows)
+			if (s.exact >= 0) out << eng.words()[s.guess] << ' ' << s.exact << '\n';
+		if (!out) return;
+	}
+	std::filesystem::rename(tmp, path, ec);
 }
 
 bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
@@ -198,42 +274,43 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 		if (report) report(LOOKAHEAD, out);
 	}
 
+	// The opening is the same every game, so its exact results are kept on disk.
+	const std::string cache = turns_.empty() ? opener_cache(eng_, hard_, opt.cache_dir) : std::string();
+	if (!cache.empty() && load_cache(cache, *this, out))
+	{
+		settle(out);
+		if (report) report(EXACT, out);
+	}
+
 	if (opt.exact_top > 0 || opt.exact_prove)
 	{
 		ExactSolver solver(eng_, hard_, opt.threads);
 		const int left = MAX_GUESSES - out.played;
 		const HardRule r = rule();
 		const size_t chunk = std::max<size_t>(8, std::thread::hardware_concurrency());
-		const size_t top = opt.exact_top;
-		size_t done = 0;
-		int best = INF;
-		while (done < out.rows.size())
+		for (;;)
 		{
-			size_t want = done < top ? top : done + chunk;
-			want = std::min(want, out.rows.size());
-			std::vector<int> g1s;
-			for (size_t i = done; i < want; i++) g1s.push_back(out.rows[i].guess);
-			std::vector<int> ex;
-			auto prog = [&](double f) {
-				if (progress) progress(EXACT, std::min(1.0, (done + f * g1s.size()) / want));
-			};
-			if (!solver.totals(out.cands, g1s, left, r, ex, prog, cancel)) return false;
-			for (size_t i = 0; i < g1s.size(); i++)
+			settle(out);
+			// Exact values for the best `exact_top` rows first, then (to prove the best)
+			// the unsolved rows with the lowest bounds, which come first among the unsolved.
+			std::vector<size_t> todo;
+			for (size_t i = 0; i < out.rows.size() && i < (size_t)opt.exact_top; i++)
+				if (out.rows[i].exact < 0) todo.push_back(i);
+			if (todo.empty())
 			{
-				out.rows[done + i].exact = ex[i];
-				best = std::min(best, ex[i]);
+				if (out.proven || !opt.exact_prove) break;
+				for (size_t i = 0; i < out.rows.size() && todo.size() < chunk; i++)
+					if (out.rows[i].exact < 0) todo.push_back(i);
+				if (todo.empty()) break;
 			}
-			done = want;
-			// Only the solved rows are reordered, so the rest stays sorted by lower bound.
-			std::stable_sort(out.rows.begin(), out.rows.begin() + done,
-				[&](const Suggestion & x, const Suggestion & y) { return better(out, x, y); });
-			out.proven = best < INF && std::all_of(out.rows.begin() + done, out.rows.end(),
-				[&](const Suggestion & s) { return s.la.total >= best; });
+			std::vector<int> g1s, ex;
+			for (size_t i : todo) g1s.push_back(out.rows[i].guess);
+			if (!solver.totals(out.cands, g1s, left, r, ex, stage_progress(EXACT), cancel)) return false;
+			for (size_t k = 0; k < todo.size(); k++) out.rows[todo[k]].exact = ex[k];
+			settle(out);
+			if (!cache.empty()) save_cache(cache, eng_, out);
 			if (report) report(EXACT, out);
-			if (done >= top && (out.proven || !opt.exact_prove)) break;
 		}
-		sort_rows(out);
-		if (report) report(EXACT, out);
 	}
 	return true;
 }
