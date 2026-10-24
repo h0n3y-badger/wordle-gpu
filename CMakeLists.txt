@@ -15,8 +15,8 @@ endif()
 set(WORDS_CPP ${CMAKE_BINARY_DIR}/words_data.cpp)
 add_custom_command(OUTPUT ${WORDS_CPP}
 	COMMAND ${CMAKE_COMMAND} -DOUT=${WORDS_CPP} -DALLOWED=${CMAKE_SOURCE_DIR}/data/allowed.txt
-		-DANSWERS=${CMAKE_SOURCE_DIR}/data/answers.txt -P ${CMAKE_SOURCE_DIR}/cmake/embed_words.cmake
-	DEPENDS data/allowed.txt data/answers.txt cmake/embed_words.cmake)
+		-DANSWERS=${CMAKE_SOURCE_DIR}/data/answers.txt -DNYT=${CMAKE_SOURCE_DIR}/data/nyt-answers.txt -P ${CMAKE_SOURCE_DIR}/cmake/embed_words.cmake
+	DEPENDS data/allowed.txt data/answers.txt data/nyt-answers.txt cmake/embed_words.cmake)
 
 find_package(Threads REQUIRED)
 add_library(wordlecore STATIC src/engine.cu src/exact.cpp src/game.cpp ${WORDS_CPP})
@@ -37,6 +37,7 @@ else()
 endif()
 
 install(TARGETS wordle-gpu-cli DESTINATION bin)
+install(PROGRAMS tools/wordle-gpu-update-answers DESTINATION bin)
 if(Qt6_FOUND)
 	install(TARGETS wordle-gpu DESTINATION bin)
 	install(FILES wordle-gpu.desktop DESTINATION share/applications)

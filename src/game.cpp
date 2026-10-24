@@ -12,6 +12,7 @@
 
 extern const char WORDS_ALLOWED[];
 extern const char WORDS_ANSWERS[];
+extern const char WORDS_NYT[];
 
 static bool valid_word(const std::string & w)
 {
@@ -32,10 +33,33 @@ static std::vector<std::string> parse_list(std::istream & in, const std::string 
 	return out;
 }
 
+std::vector<std::string> read_dated_list(std::istream & in)
+{
+	std::vector<std::string> out;
+	for (std::string line; std::getline(in, line);)
+	{
+		std::istringstream ls(line);
+		std::string date, word;
+		if (line.empty() || line[0] == '#' || !(ls >> date >> word)) continue;
+		if (valid_word(word)) out.push_back(word);
+	}
+	return out;
+}
+
+std::string nyt_answers_path()
+{
+	if (const char * x = getenv("XDG_DATA_HOME"); x && *x) return std::string(x) + "/wordle-gpu/nyt-answers.txt";
+	if (const char * h = getenv("HOME"); h && *h) return std::string(h) + "/.local/share/wordle-gpu/nyt-answers.txt";
+	return {};
+}
+
 WordLists builtin_lists()
 {
-	std::istringstream a(WORDS_ALLOWED), b(WORDS_ANSWERS);
-	return { parse_list(a, "allowed"), parse_list(b, "answers") };
+	std::istringstream a(WORDS_ALLOWED), b(WORDS_ANSWERS), c(WORDS_NYT);
+	WordLists lists{ parse_list(a, "allowed"), parse_list(b, "answers"), read_dated_list(c) };
+	if (std::ifstream user(nyt_answers_path()); user)
+		for (auto & w : read_dated_list(user)) lists.nyt.push_back(std::move(w));
+	return lists;
 }
 
 std::vector<std::string> read_list(const std::string & path)
@@ -45,21 +69,27 @@ std::vector<std::string> read_list(const std::string & path)
 	return parse_list(in, path);
 }
 
-std::vector<int> prepare_pool(WordLists & lists, bool all)
+std::vector<int> prepare_pool(WordLists & lists, Pool which)
 {
 	auto & w = lists.allowed;
+	// The NYT's guess list grows with its picks; ours may lag behind.
+	w.insert(w.end(), lists.nyt.begin(), lists.nyt.end());
 	std::sort(w.begin(), w.end());
 	w.erase(std::unique(w.begin(), w.end()), w.end());
 	std::vector<int> pool;
-	if (all)
-		for (size_t i = 0; i < w.size(); i++) pool.push_back((int)i);
-	else
-		for (const auto & a : lists.answers)
+	auto add = [&](const std::vector<std::string> & list) {
+		for (const auto & a : list)
 		{
 			auto it = std::lower_bound(w.begin(), w.end(), a);
 			if (it == w.end() || *it != a) throw std::runtime_error("answer not in the allowed list: " + a);
 			pool.push_back((int)(it - w.begin()));
 		}
+	};
+	if (which == Pool::ALL)
+		for (size_t i = 0; i < w.size(); i++) pool.push_back((int)i);
+	else
+		add(lists.answers);
+	if (which == Pool::NYT) add(lists.nyt);
 	std::sort(pool.begin(), pool.end());
 	pool.erase(std::unique(pool.begin(), pool.end()), pool.end());
 	return pool;
@@ -305,11 +335,12 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 			}
 			std::vector<int> g1s, ex;
 			for (size_t i : todo) g1s.push_back(out.rows[i].guess);
-			if (!solver.totals(out.cands, g1s, left, r, ex, stage_progress(EXACT), cancel)) return false;
+			const bool ok = solver.totals(out.cands, g1s, left, r, ex, stage_progress(EXACT), cancel);
 			for (size_t k = 0; k < todo.size(); k++) out.rows[todo[k]].exact = ex[k];
 			settle(out);
 			if (!cache.empty()) save_cache(cache, eng_, out);
 			if (report) report(EXACT, out);
+			if (!ok) return false;
 		}
 	}
 	return true;

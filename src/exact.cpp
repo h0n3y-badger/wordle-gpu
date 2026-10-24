@@ -193,7 +193,7 @@ bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<
 
 	std::atomic<size_t> next{ 0 }, done{ 0 };
 	std::atomic<bool> cancelled{ false };
-	std::vector<int> results(tasks.size());
+	std::vector<int> results(tasks.size(), -1);
 	std::mutex progress_mu;
 	auto work = [&] {
 		try
@@ -215,9 +215,12 @@ bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<
 	for (int t = 0; t < threads_; t++) pool.emplace_back(work);
 	for (auto & t : pool) t.join();
 	cancel_ = nullptr;
-	if (cancelled) return false;
 
+	// After a cancel, guesses with every group solved still get their value.
 	for (size_t t = 0; t < tasks.size(); t++)
-		out[tasks[t].idx] = std::min(INF, out[tasks[t].idx] + results[t]);
-	return true;
+	{
+		int & o = out[tasks[t].idx];
+		if (o >= 0) o = results[t] < 0 ? -1 : std::min(INF, o + results[t]);
+	}
+	return !cancelled;
 }

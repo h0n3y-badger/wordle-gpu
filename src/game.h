@@ -13,19 +13,32 @@ struct WordLists
 {
 	std::vector<std::string> allowed; // every accepted guess
 	std::vector<std::string> answers; // the original 2315 answers
+	std::vector<std::string> nyt;     // answers the NYT has used, including its own picks
 };
 
-// The lists compiled into the binary (data/allowed.txt, data/answers.txt).
+// The lists compiled into the binary (data/allowed.txt, data/answers.txt,
+// data/nyt-answers.txt), plus any newer NYT answers fetched by wordle-gpu-update-answers.
 WordLists builtin_lists();
+// Where wordle-gpu-update-answers keeps the NYT answers: $XDG_DATA_HOME/wordle-gpu/nyt-answers.txt.
+std::string nyt_answers_path();
+// Second words of "date word" lines, '#' comments skipped.
+std::vector<std::string> read_dated_list(std::istream & in);
 // One word per line; throws on unreadable files or words that are not 5 letters a-z.
 std::vector<std::string> read_list(const std::string & path);
 
 // $XDG_CACHE_HOME/wordle-gpu or ~/.cache/wordle-gpu.
 std::string default_cache_dir();
 
-// Sorts and dedups lists.allowed; returns the indices of the possible answers in it
-// (every word when all is set). Throws if an answer is not an allowed guess.
-std::vector<int> prepare_pool(WordLists & lists, bool all);
+enum class Pool
+{
+	NYT,      // the original answers plus every answer the NYT has used
+	ORIGINAL, // the original 2315 answers
+	ALL,      // any allowed word
+};
+
+// Sorts and dedups lists.allowed (adding NYT answers missing from it); returns the
+// indices of the pool's possible answers in it. Throws if an answer is not an allowed guess.
+std::vector<int> prepare_pool(WordLists & lists, Pool pool);
 
 // "gybbg", "21002" or "GY..G": g/2 green, y/1 yellow, b/x/./-/0 gray. Empty if malformed.
 std::optional<uint8_t> parse_pattern(const std::string & s);
@@ -92,7 +105,7 @@ public:
 	// Called after each stage with the partial result; return value unused.
 	using Report = std::function<void(Stage, const Analysis &)>;
 	using Progress = std::function<void(Stage, double)>;
-	// Returns false if cancelled (the last reported Analysis is still valid).
+	// Returns false if cancelled; out keeps everything finished by then.
 	bool analyze(const Options & opt, Analysis & out, const Report & report = {},
 		const Progress & progress = {}, const std::atomic<bool> * cancel = nullptr);
 

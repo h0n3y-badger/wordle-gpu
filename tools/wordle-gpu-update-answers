@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Fetch past NYT Wordle answers into a "date word" list that wordle-gpu adds to its
+answer pool. Only dates missing from the file are fetched, and never past --through
+(default yesterday, so today's puzzle isn't spoiled)."""
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+FIRST = dt.date(2021, 6, 19)
+URL = "https://www.nytimes.com/svc/wordle/v2/{}.json"
+DEFAULT_OUT = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                           "wordle-gpu", "nyt-answers.txt")
+
+
+def fetch(day):
+    req = urllib.request.Request(URL.format(day.isoformat()), headers={"User-Agent": "Mozilla/5.0"})
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                word = json.load(r)["solution"].strip().lower()
+            if len(word) == 5 and word.isalpha() and word.isascii():
+                return day, word
+            return day, None
+        except Exception as e:
+            err = e
+            time.sleep(1 + 2 * attempt)
+    print(f"{day}: {err}", file=sys.stderr)
+    return day, None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("-o", "--out", default=DEFAULT_OUT, help=f"list to update (default {DEFAULT_OUT})")
+    ap.add_argument("--through", type=dt.date.fromisoformat,
+                    default=dt.date.today() - dt.timedelta(days=1),
+                    help="last date to fetch, YYYY-MM-DD (default yesterday; never later than today)")
+    args = ap.parse_args()
+    last = min(args.through, dt.date.today())
+
+    known = {}
+    if os.path.exists(args.out):
+        with open(args.out) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and not line.startswith("#"):
+                    known[dt.date.fromisoformat(parts[0])] = parts[1]
+    days = [FIRST + dt.timedelta(d) for d in range((last - FIRST).days + 1)]
+    todo = [d for d in days if d not in known]
+    print(f"{len(known)} answers known, fetching {len(todo)} through {last}", file=sys.stderr)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for i, (day, word) in enumerate(pool.map(fetch, todo), 1):
+            if word:
+                known[day] = word
+            if i % 100 == 0:
+                print(f"  {i}/{len(todo)}", file=sys.stderr)
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    tmp = args.out + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("# NYT Wordle answers by date, from nytimes.com/svc/wordle/v2/<date>.json\n")
+        for day in sorted(known):
+            f.write(f"{day.isoformat()} {known[day]}\n")
+    os.replace(tmp, args.out)
+    missing = len(days) - sum(d in known for d in days)
+    print(f"{len(known)} answers in {args.out}" + (f", {missing} dates failed" if missing else ""),
+          file=sys.stderr)
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -19,7 +19,7 @@ public:
 
 	// For each first guess g, the minimum total number of guesses summed over all
 	// candidates (each needing at most `left` guesses, g included), or INF.
-	// Returns false if cancelled.
+	// Returns false if cancelled; guesses finished before that keep their value, the rest get -1.
 	bool totals(const std::vector<uint16_t> & cands, const std::vector<int> & g1s, int left,
 		const HardRule & rule, std::vector<int> & out,
 		const std::function<void(double)> & progress = {}, const std::atomic<bool> * cancel = nullptr);

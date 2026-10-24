@@ -27,8 +27,7 @@ constexpr int AUTO_EXACT = 400;
 
 MainWindow::MainWindow(WordLists lists, QWidget * parent) : QMainWindow(parent), lists_(std::move(lists))
 {
-	pools_[0] = prepare_pool(lists_, false);
-	pools_[1] = prepare_pool(lists_, true);
+	for (Pool p : { Pool::NYT, Pool::ORIGINAL, Pool::ALL }) pools_[(int)p] = prepare_pool(lists_, p);
 	setWindowTitle(tr("Wordle GPU Solver"));
 
 	// Left: board and options.
@@ -46,8 +45,12 @@ MainWindow::MainWindow(WordLists lists, QWidget * parent) : QMainWindow(parent),
 	hard_ = new QCheckBox(tr("Hard mode"));
 	lv->addWidget(hard_);
 	pool_ = new QComboBox;
-	pool_->addItem(tr("Answers: Wordle list (%1)").arg(pools_[0].size()));
-	pool_->addItem(tr("Answers: any valid word (%1)").arg(pools_[1].size()));
+	pool_->addItem(tr("Answers: original + NYT picks (%1)").arg(pools_[(int)Pool::NYT].size()));
+	pool_->addItem(tr("Answers: original list (%1)").arg(pools_[(int)Pool::ORIGINAL].size()));
+	pool_->addItem(tr("Answers: any valid word (%1)").arg(pools_[(int)Pool::ALL].size()));
+	pool_->setToolTip(tr("Words that may be the answer. The NYT has picked %1 answers outside the "
+		"original list so far;\nrun wordle-gpu-update-answers now and then to fetch new ones.")
+		.arg(pools_[(int)Pool::NYT].size() - pools_[(int)Pool::ORIGINAL].size()));
 	lv->addWidget(pool_);
 	auto * help = new QLabel(tr("Type a guess, click its tiles to match the colours you got "
 		"(right-click goes back, or keys 1-5), then press Enter.\n"

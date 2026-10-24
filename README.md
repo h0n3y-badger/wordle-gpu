@@ -68,12 +68,28 @@ GPU work is cut into launches of about 25 ms so the desktop stays smooth.
 Patterns are g/y/b (or 2/1/0) per letter. `-H` hard mode, `-a` any word can be
 the answer, `-r` raw output for scripts, `-h` for the rest.
 
+Time budget and interactive play:
+
+    ./build/wordle-gpu-cli -T 30 tarse=bbbby     # spend up to 30 s, show the best found
+    ./build/wordle-gpu-cli -i -T 2m              # play a game, up to 2 min per position
+
+With `-T` the GPU brute force runs first, then the exact search keeps going until the best
+guess is proven or the time is up. Ctrl-C stops early, and either way it prints the best ranking
+so far. In `-i` mode type `tarse bbygb` per turn, plus `undo`, `new` and `quit`.
+
 ## Word lists
 
-`data/allowed.txt` (14,855 accepted guesses) and `data/answers.txt` (the
-original 2,315 answers) are compiled in. `-w` / `-A` load others. The NYT now picks
-answers by hand, and some recent ones are outside the original list. Switch
-the answer list if a game rules everything out.
+`data/allowed.txt` (14,855 accepted guesses), `data/answers.txt` (the original
+2,315 answers) and `data/nyt-answers.txt` (every answer the NYT has used, by date) are
+compiled in. The NYT picks answers by hand now; by 2026-10-24, 71 of them were outside
+the original list (HOLEY, KEFIR, EMOJI…), and some answers have repeated. The default
+answer pool is therefore the original list plus every NYT answer so far (2,386 words).
+`-o` uses only the original list, and `-a` allows any valid word.
+
+`wordle-gpu-update-answers` fetches newer NYT answers into
+`~/.local/share/wordle-gpu/nyt-answers.txt`, which both programs read at startup. It
+fetches only dates it doesn't have yet, and never later than yesterday unless you pass
+`--through`, so it can't spoil today's puzzle. `-w` / `-A` load other lists.
 
 ## Checks
 

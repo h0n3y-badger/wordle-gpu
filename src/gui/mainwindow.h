@@ -40,8 +40,8 @@ private:
 	QString validate(const QString & w) const;
 
 	WordLists lists_;
-	std::vector<int> pools_[2];  // answers, every allowed word
-	std::unique_ptr<Engine> engines_[2];
+	std::vector<int> pools_[3];  // indexed by Pool
+	std::unique_ptr<Engine> engines_[3];
 
 	Board * board_;
 	QCheckBox * hard_;
