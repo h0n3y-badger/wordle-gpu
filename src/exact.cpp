@@ -88,6 +88,29 @@ std::string make_key(const uint16_t * s, int n, int left, const HardRule * rule)
 	return k;
 }
 
+// Whether some candidate in s tells all n apart, so guessing it costs 2n-1 in total.
+// Stops at a candidate's first repeated feedback.
+inline bool perfect_split(const Engine & eng, const uint16_t * s, int n)
+{
+	if (n > NPAT) return false;
+	const auto & pool = eng.pool();
+	for (int i = 0; i < n; i++)
+	{
+		const uint8_t * row = eng.row(pool[s[i]]);
+		uint64_t seen[4] = { 0, 0, 0, 0 };
+		int j = 0;
+		for (; j < n; j++)
+		{
+			const uint8_t f = row[s[j]];
+			const uint64_t bit = 1ull << (f & 63);
+			if (seen[f >> 6] & bit) break;
+			seen[f >> 6] |= bit;
+		}
+		if (j == n) return true;
+	}
+	return false;
+}
+
 #ifdef __AVX512BW__
 // Distinct feedbacks over the n candidate rows for 64 neighbouring guesses, one byte per guess:
 // a row adds one wherever it differs from every earlier row. Four rows go at a time so the
@@ -248,19 +271,12 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 
 	const auto & pool = eng_.pool();
 	const auto & words = eng_.words();
-	Hist & h = tl_hist;
 
 	// Guessing a candidate that tells all the others apart is optimal: 2n-1.
-	for (int i = 0; i < n; i++)
+	if (perfect_split(eng_, s, n))
 	{
-		const uint8_t * row = eng_.row(pool[s[i]]);
-		h.reset();
-		for (int j = 0; j < n; j++) h.add(row[s[j]]);
-		if (h.nused == n)
-		{
-			memo_->put(key, { 2 * n - 1, true });
-			return 2 * n - 1;
-		}
+		memo_->put(key, { 2 * n - 1, true });
+		return 2 * n - 1;
 	}
 
 	// Otherwise every guess has bound >= 2n: a candidate splits the rest into at most
@@ -343,13 +359,15 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 		return INF;
 	}
 
-	// Counting sort by bound, ties in guess order. Bounds lie in [2n-1, 3n-2].
+	// Counting sort by bound, then non-candidates before candidates (one more group, so
+	// smaller ones), then guess order. Bounds lie in [2n-1, 3n-2].
 	const int lb0 = 2 * n - 1;
-	sc.bucket.assign(n + 1, 0);
-	for (const RawOpt & o : sc.raw) sc.bucket[o.lb - lb0]++;
-	for (int i = 0, sum = 0; i <= n; i++) { const int c = sc.bucket[i]; sc.bucket[i] = sum; sum += c; }
+	auto slot = [&](const RawOpt & o) { return 2 * (o.lb - lb0) + (int)(sc.cand[o.g >> 6] >> (o.g & 63) & 1); };
+	sc.bucket.assign(2 * n + 2, 0);
+	for (const RawOpt & o : sc.raw) sc.bucket[slot(o)]++;
+	for (int i = 0, sum = 0; i < 2 * n + 2; i++) { const int c = sc.bucket[i]; sc.bucket[i] = sum; sum += c; }
 	std::vector<Opt> opts(sc.raw.size());
-	for (const RawOpt & o : sc.raw) opts[sc.bucket[o.lb - lb0]++] = { o.lb, o.g };
+	for (const RawOpt & o : sc.raw) opts[sc.bucket[slot(o)]++] = { o.lb, o.g };
 
 	int best = beta;
 	if (n < SHARE_MIN || threads_ == 1)
@@ -393,30 +411,62 @@ int ExactSolver::try_option(const uint16_t * s, int n, int left, const HardRule 
 	const uint8_t * row = eng_.row(o.g);
 	h.reset();
 	for (int j = 0; j < n; j++) h.add(row[s[j]]);
-	std::vector<std::pair<int, int>> groups; // (size, pattern)
+	// Groups of one or two words take exactly 2s-1 (left >= 3 here), so they are left
+	// out. The others go smallest first, (size, pattern) packed into one integer: small
+	// groups are cheap to solve and refute most options long before a big one would.
+	uint32_t groups[NPAT];
+	int ng = 0;
 	for (int k = 0; k < h.nused; k++)
-		if (h.used[k] != ALL_GREEN) groups.push_back({ h.cnt[h.used[k]], h.used[k] });
-	// Largest groups first: they decide whether the bound is beaten.
-	std::sort(groups.begin(), groups.end(), std::greater<>());
-	int start[NPAT];
-	int at = 0;
-	for (auto [size, pat] : groups) { start[pat] = at; at += size; }
-	std::vector<uint16_t> part(at);
+	{
+		const uint8_t f = h.used[k];
+		if (f != ALL_GREEN && h.cnt[f] >= 3) groups[ng++] = (uint32_t)h.cnt[f] << 8 | f;
+	}
+	std::sort(groups, groups + ng);
+	// total: what is settled exactly; rest: lower bounds of the groups still open.
+	// o.lb charges every group 2s-1.
+	int total = o.lb, rest = 0;
+	int off[NPAT], start[NPAT], at = 0;
+	for (int i = 0; i < ng; i++)
+	{
+		const int size = groups[i] >> 8;
+		off[i] = start[groups[i] & 255] = at;
+		at += size;
+		total -= 2 * size - 1;
+		rest += 2 * size - 1;
+	}
+	// Children of a shared node read their set from here, so it must not move until we return.
+	constexpr int STACK_PART = 1024;
+	uint16_t stack_part[STACK_PART];
+	std::unique_ptr<uint16_t[]> heap_part;
+	uint16_t * part = stack_part;
+	if (at > STACK_PART) { heap_part.reset(new uint16_t[at]); part = heap_part.get(); }
 	for (int j = 0; j < n; j++)
 	{
 		const uint8_t f = row[s[j]];
-		if (f != ALL_GREEN) part[start[f]++] = s[j];
+		if (f != ALL_GREEN && h.cnt[f] >= 3) part[start[f]++] = s[j];
 	}
 
-	int total = n, rest = o.lb - n;
-	at = 0;
-	for (auto [size, pat] : groups)
+	// A group some candidate splits apart takes exactly 2s-1, as solve would find;
+	// any other at least 2s. That alone refutes many options.
+	int open[NPAT], nopen = 0;
+	for (int i = 0; i < ng; i++)
 	{
-		rest -= 2 * size - 1;
+		const int size = groups[i] >> 8;
+		if (perfect_split(eng_, part + off[i], size)) { total += 2 * size - 1; rest -= 2 * size - 1; }
+		else
+		{
+			open[nopen++] = i;
+			if (total + ++rest >= best) return best;
+		}
+	}
+	for (int k = 0; k < nopen; k++)
+	{
+		const int i = open[k];
+		const int size = groups[i] >> 8;
+		rest -= 2 * size;
 		HardRule sub = rule;
-		if (hard_) sub.add(eng_.words()[o.g].data(), pat);
-		total += solve(part.data() + at, size, left - 1, sub, best - total - rest);
-		at += size;
+		if (hard_) sub.add(eng_.words()[o.g].data(), groups[i] & 255);
+		total += solve(part + off[i], size, left - 1, sub, best - total - rest);
 		if (total + rest >= best) return best;
 	}
 	return total;
