@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <tuple>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -1000,4 +1001,55 @@ bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<
 		if (!ran[t] && !(beta && out[i] >= (*beta)[i])) out[i] = -1;
 	}
 	return !cancelled;
+}
+
+int ExactSolver::choose(const uint16_t * s, int n, int left, const HardRule & rule)
+{
+	const int best = solve(s, n, left, rule, INF);
+	if (best >= INF) return -1;
+	const auto & pool = eng_.pool();
+	if (n == 1) return pool[s[0]];
+
+	// Every legal guess whose bound allows the optimum, lowest bound first, words that
+	// could be the answer first among equals.
+	struct Try { int lb, cand, g; };
+	std::vector<Try> tries;
+	std::vector<uint8_t> in_set(eng_.num_guesses(), 0);
+	for (int j = 0; j < n; j++) in_set[pool[s[j]]] = 1;
+	for (int g = 0; g < eng_.num_guesses(); g++)
+	{
+		if (hard_ && !rule.allows(eng_.words()[g].data())) continue;
+		const uint8_t * row = eng_.row(g);
+		uint64_t seen[4] = {};
+		for (int j = 0; j < n; j++) seen[row[s[j]] >> 6] |= 1ull << (row[s[j]] & 63);
+		int distinct = 0;
+		for (uint64_t w : seen) distinct += std::popcount(w);
+		const int in = in_set[g];
+		if (!in && distinct == 1) continue;
+		const int lb = 3 * n - in - distinct;
+		if (lb <= best) tries.push_back({ lb, -in, g });
+	}
+	std::sort(tries.begin(), tries.end(), [](const Try & a, const Try & b) {
+		return std::tie(a.lb, a.cand, a.g) < std::tie(b.lb, b.cand, b.g);
+	});
+
+	std::vector<uint16_t> part(n);
+	for (const Try & t : tries)
+	{
+		const uint8_t * row = eng_.row(t.g);
+		int count[NPAT] = {}, start[NPAT];
+		for (int j = 0; j < n; j++) count[row[s[j]]]++;
+		for (int p = 0, at = 0; p < NPAT; p++) { start[p] = at; at += count[p]; }
+		for (int j = 0; j < n; j++) part[start[row[s[j]]]++] = s[j];
+		int total = n;
+		for (int p = 0, at = 0; p < NPAT && total <= best; at += count[p], p++)
+		{
+			if (!count[p] || p == ALL_GREEN) continue;
+			HardRule sub = rule;
+			if (hard_) sub.add(eng_.words()[t.g].data(), p);
+			total += solve(part.data() + at, count[p], left - 1, sub, best - total + 1);
+		}
+		if (total == best) return t.g;
+	}
+	return -1; // unreachable: the optimum is achieved by some guess
 }

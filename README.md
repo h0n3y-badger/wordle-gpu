@@ -85,6 +85,26 @@ With `-T` the GPU brute force runs first, then the exact search keeps going unti
 guess is proven or the time is up. Ctrl-C stops early, and either way it prints the best ranking
 so far. In `-i` mode type `tarse bbygb` per turn, plus `undo`, `new` and `quit`.
 
+## Solving the whole game
+
+    wordle-gpu-solve                 # until every opener is solved, or Ctrl-C
+    wordle-gpu-solve -T 30m -k 50    # stop after 30 minutes, write games for the best 50
+    wordle-gpu-solve -H tarse=bbbby  # hard mode, starting after a first guess
+
+`wordle-gpu-solve` needs no game input. It runs the GPU brute force for every opening
+guess, then solves openers exactly (no refutation shortcuts), most promising first,
+until all are done, `-T` runs out or you press Ctrl-C. Then it writes:
+
+- `PREFIX-openers.txt`: every opener ranked by average score (exact for the solved
+  ones, a lower bound for the rest), with the guess-count spread and worst case for
+  the best `-k`;
+- `PREFIX-games.txt`: for the best `-k` openers (default 10, `-k all` for every solved
+  one), every game the optimal strategy plays: the answer, the number of guesses and
+  each guess with its colours, shortest games first.
+
+PREFIX defaults to `wordle-solve-<answers>[-hard]` in the current directory (`-O` changes it).
+All 14,855 openers take about two minutes in normal mode.
+
 ## Word lists
 
 `data/allowed.txt` (14,855 accepted guesses), `data/answers.txt` (the original

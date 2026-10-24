@@ -34,6 +34,10 @@ public:
 	// Minimum total guesses for the candidate set, < beta, or some value >= beta.
 	int solve(const uint16_t * s, int n, int left, const HardRule & rule, int beta);
 
+	// A guess (word index) that achieves the set's minimum total, or -1 if the set can't
+	// be finished within `left` guesses. Lowest bound first, so usually the first try.
+	int choose(const uint16_t * s, int n, int left, const HardRule & rule);
+
 private:
 	struct Memo;
 	struct Tables;

@@ -27,6 +27,9 @@ target_compile_options(wordlecore PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=n
 add_executable(wordle-gpu-cli src/cli.cpp)
 target_link_libraries(wordle-gpu-cli wordlecore)
 
+add_executable(wordle-gpu-solve src/solve.cpp)
+target_link_libraries(wordle-gpu-solve wordlecore)
+
 find_package(Qt6 COMPONENTS Widgets Concurrent)
 if(Qt6_FOUND)
 	set(CMAKE_AUTOMOC ON)
@@ -36,7 +39,7 @@ else()
 	message(STATUS "Qt6 Widgets not found: building the CLI only")
 endif()
 
-install(TARGETS wordle-gpu-cli DESTINATION bin)
+install(TARGETS wordle-gpu-cli wordle-gpu-solve DESTINATION bin)
 install(PROGRAMS tools/wordle-gpu-update-answers DESTINATION bin)
 if(Qt6_FOUND)
 	install(TARGETS wordle-gpu DESTINATION bin)
