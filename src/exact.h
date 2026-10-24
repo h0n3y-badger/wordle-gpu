@@ -31,6 +31,7 @@ public:
 
 private:
 	struct Memo;
+	struct Tables;
 	struct Opt { int lb, g; };
 	// A node whose options any idle thread may help evaluate.
 	struct Shared
@@ -56,5 +57,6 @@ private:
 	bool hard_;
 	int threads_;
 	std::unique_ptr<Memo> memo_;
+	std::unique_ptr<Tables> tab_;
 	const std::atomic<bool> * cancel_ = nullptr;
 };

@@ -1,12 +1,18 @@
 #include "exact.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#ifdef __AVX512BW__
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -32,6 +38,41 @@ struct Hist
 
 thread_local Hist tl_hist;
 
+// Sets up to this size count distinct feedbacks 64 guesses at a time by comparing
+// every pair of candidates (counts are bytes, so at most 255).
+constexpr int VEC_MAX = 192;
+
+struct RawOpt { int lb, g; };
+
+// Per-thread scratch for the guess scan; nothing in it lives across a recursive call.
+struct Scratch
+{
+#ifdef __AVX512BW__
+	__m512i buf[VEC_MAX];
+#endif
+	const uint8_t * rows[VEC_MAX];
+	std::vector<uint64_t> allow, cand; // one bit per guess
+	std::vector<RawOpt> raw;
+	std::vector<int> bucket;
+};
+
+thread_local Scratch tl_scratch;
+
+// The constraints in a canonical order, so equal rules reached in a different order share entries.
+HardRule canonical(const HardRule & r)
+{
+	HardRule c = r;
+	int m = 0;
+	while (m < 5 && c.letter[m]) m++;
+	for (int i = 1; i < m; i++)
+		for (int j = i; j > 0 && (unsigned char)c.letter[j - 1] > (unsigned char)c.letter[j]; j--)
+		{
+			std::swap(c.letter[j - 1], c.letter[j]);
+			std::swap(c.count[j - 1], c.count[j]);
+		}
+	return c;
+}
+
 // Nodes with at least this many candidates share their options with idle threads.
 constexpr int SHARE_MIN = 24;
 
@@ -39,11 +80,95 @@ std::string make_key(const uint16_t * s, int n, int left, const HardRule * rule)
 {
 	std::string k((const char *)s, n * sizeof(uint16_t));
 	k.push_back((char)left);
-	if (rule) k.append((const char *)rule, sizeof(HardRule));
+	if (rule)
+	{
+		const HardRule c = canonical(*rule);
+		k.append((const char *)&c, sizeof(HardRule));
+	}
 	return k;
 }
 
+#ifdef __AVX512BW__
+// Distinct feedbacks over the n candidate rows for 64 neighbouring guesses, one byte per guess:
+// a row adds one wherever it differs from every earlier row. Four rows go at a time so the
+// four masked-compare chains overlap.
+inline __m512i distinct64(const uint8_t * const * rows, size_t off, int n, __m512i * buf)
+{
+	const __m512i one = _mm512_set1_epi8(1);
+	__m512i cnt = one;
+	buf[0] = _mm512_load_si512(rows[0] + off);
+	int j = 1;
+	for (; j + 3 < n; j += 4)
+	{
+		const __m512i a = _mm512_load_si512(rows[j] + off), b = _mm512_load_si512(rows[j + 1] + off);
+		const __m512i c = _mm512_load_si512(rows[j + 2] + off), d = _mm512_load_si512(rows[j + 3] + off);
+		__mmask64 ka = ~0ull;
+		__mmask64 kb = _mm512_cmpneq_epu8_mask(b, a);
+		__mmask64 kc = _mm512_mask_cmpneq_epu8_mask(_mm512_cmpneq_epu8_mask(c, a), c, b);
+		__mmask64 kd = _mm512_mask_cmpneq_epu8_mask(_mm512_mask_cmpneq_epu8_mask(_mm512_cmpneq_epu8_mask(d, a), d, b), d, c);
+		for (int i = 0; i < j; i++)
+		{
+			const __m512i x = buf[i];
+			ka = _mm512_mask_cmpneq_epu8_mask(ka, a, x);
+			kb = _mm512_mask_cmpneq_epu8_mask(kb, b, x);
+			kc = _mm512_mask_cmpneq_epu8_mask(kc, c, x);
+			kd = _mm512_mask_cmpneq_epu8_mask(kd, d, x);
+		}
+		buf[j] = a;
+		buf[j + 1] = b;
+		buf[j + 2] = c;
+		buf[j + 3] = d;
+		cnt = _mm512_mask_add_epi8(cnt, ka, cnt, one);
+		cnt = _mm512_mask_add_epi8(cnt, kb, cnt, one);
+		cnt = _mm512_mask_add_epi8(cnt, kc, cnt, one);
+		cnt = _mm512_mask_add_epi8(cnt, kd, cnt, one);
+	}
+	for (; j < n; j++)
+	{
+		const __m512i a = _mm512_load_si512(rows[j] + off);
+		__mmask64 ka = ~0ull;
+		for (int i = 0; i < j; i++) ka = _mm512_mask_cmpneq_epu8_mask(ka, a, buf[i]);
+		buf[j] = a;
+		cnt = _mm512_mask_add_epi8(cnt, ka, cnt, one);
+	}
+	return cnt;
 }
+#endif
+
+}
+
+// Pool-major copy of the feedback table, rows padded to whole 64-guess blocks, and
+// per-letter guess bitmasks for building a hard-mode rule's allowed set.
+struct ExactSolver::Tables
+{
+	int G = 0, W = 0;   // guesses, 64-guess blocks
+	size_t stride = 0;  // W * 64
+	uint8_t * pm = nullptr;
+	std::vector<uint64_t> full;    // the real guesses of each block
+	std::vector<uint64_t> green;   // [(pos * 26 + letter) * W + block]
+	std::vector<uint64_t> atleast; // [(letter * 5 + copies - 1) * W + block]
+	bool letters_ok = true;        // every word is a-z
+
+	~Tables() { std::free(pm); }
+	const uint8_t * prow(int p) const { return pm + (size_t)p * stride; }
+
+	void allowed(const HardRule & r, const std::vector<std::string> & words, uint64_t * out) const
+	{
+		if (!letters_ok)
+		{
+			std::fill(out, out + W, 0);
+			for (int g = 0; g < G; g++)
+				if (r.allows(words[g].data())) out[g >> 6] |= 1ull << (g & 63);
+			return;
+		}
+		std::copy(full.begin(), full.end(), out);
+		auto apply = [&](const uint64_t * m) { for (int b = 0; b < W; b++) out[b] &= m[b]; };
+		for (int i = 0; i < 5; i++)
+			if (r.green[i]) apply(&green[(size_t)(i * 26 + (r.green[i] - 'a')) * W]);
+		for (int k = 0; k < 5 && r.letter[k]; k++)
+			if (r.count[k]) apply(&atleast[(size_t)((r.letter[k] - 'a') * 5 + r.count[k] - 1) * W]);
+	}
+};
 
 struct ExactSolver::Memo
 {
@@ -74,8 +199,42 @@ struct ExactSolver::Memo
 
 ExactSolver::ExactSolver(const Engine & eng, bool hard, int threads)
 	: eng_(eng), hard_(hard), threads_(threads > 0 ? threads : (int)std::max(1u, std::thread::hardware_concurrency())),
-	  memo_(new Memo)
+	  memo_(new Memo), tab_(new Tables)
 {
+	Tables & t = *tab_;
+	const int G = eng.num_guesses(), P = eng.pool_size();
+	t.G = G;
+	t.W = (G + 63) / 64;
+	t.stride = (size_t)t.W * 64;
+	t.pm = (uint8_t *)std::aligned_alloc(64, (size_t)P * t.stride);
+	if (!t.pm) throw std::bad_alloc();
+	// Transpose in 64x64 tiles; padding guesses read as 0 and are never allowed.
+	for (int g0 = 0; g0 < (int)t.stride; g0 += 64)
+		for (int p0 = 0; p0 < P; p0 += 64)
+			for (int g = g0; g < g0 + 64; g++)
+			{
+				const uint8_t * row = g < G ? eng.row(g) : nullptr;
+				for (int p = p0; p < std::min(P, p0 + 64); p++) t.pm[(size_t)p * t.stride + g] = row ? row[p] : 0;
+			}
+
+	t.full.assign(t.W, ~0ull);
+	if (G % 64) t.full[t.W - 1] = (1ull << (G % 64)) - 1;
+	t.green.assign((size_t)5 * 26 * t.W, 0);
+	t.atleast.assign((size_t)26 * 5 * t.W, 0);
+	const auto & words = eng.words();
+	for (int g = 0; g < G && t.letters_ok; g++)
+	{
+		const char * w = words[g].data();
+		const uint64_t bit = 1ull << (g & 63);
+		for (int i = 0; i < 5; i++)
+		{
+			if (w[i] < 'a' || w[i] > 'z') { t.letters_ok = false; break; }
+			t.green[(size_t)(i * 26 + (w[i] - 'a')) * t.W + (g >> 6)] |= bit;
+			int copies = 0;
+			for (int j = 0; j < 5; j++) copies += w[j] == w[i];
+			for (int m = 1; m <= copies; m++) t.atleast[(size_t)((w[i] - 'a') * 5 + m - 1) * t.W + (g >> 6)] |= bit;
+		}
+	}
 }
 
 ExactSolver::~ExactSolver() = default;
@@ -86,6 +245,8 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	if (n == 1) return 1;
 	if (left == 1) return INF;
 	if (n == 2) return 3;
+	// Every word spends a guess and all but one at least two: no strategy beats 2n-1.
+	if (beta <= 2 * n - 1) return 2 * n - 1;
 	if (cancel_ && cancel_->load(std::memory_order_relaxed)) throw Cancelled();
 
 	const std::string key = make_key(s, n, left, hard_ ? &rule : nullptr);
@@ -109,22 +270,93 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 		}
 	}
 
-	std::vector<Opt> opts;
-	const int G = eng_.num_guesses();
-	for (int g = 0; g < G; g++)
+	// Otherwise every guess has bound >= 2n: a candidate splits the rest into at most
+	// n-2 groups, any other guess into at most n.
+	if (beta <= 2 * n) return 2 * n;
+
+	// Scan every allowed guess for its bound n + 2(n-in) - groups = 3n - in - distinct.
+	// A bound of 2n is met exactly by a non-candidate splitting all apart, or (with a
+	// guess to spare) a candidate leaving one pair: that settles the node at once.
+	// With two guesses left nothing else can finish, so only those are looked for.
+	const Tables & t = *tab_;
+	Scratch & sc = tl_scratch;
+	const int W = t.W;
+	const uint64_t * allow = t.full.data();
+	if (hard_)
 	{
-		if (hard_ && !rule.allows(words[g].data())) continue;
-		const uint8_t * row = eng_.row(g);
-		h.reset();
-		for (int j = 0; j < n; j++) h.add(row[s[j]]);
-		const int in = h.get(ALL_GREEN);
-		const int groups = h.nused - in;
-		if (!in && groups == 1) continue; // learns nothing
-		// Every word spends this guess; a group of k needs at least 2k-1 more.
-		const int lb = n + 2 * (n - in) - groups;
-		if (lb < beta) opts.push_back({ lb, g });
+		sc.allow.resize(W);
+		t.allowed(rule, words, sc.allow.data());
+		allow = sc.allow.data();
 	}
-	std::sort(opts.begin(), opts.end(), [](const Opt & a, const Opt & b) { return a.lb < b.lb; });
+	sc.cand.assign(W, 0);
+	for (int j = 0; j < n; j++) sc.cand[pool[s[j]] >> 6] |= 1ull << (pool[s[j]] & 63);
+	sc.raw.clear();
+	// Guesses with more distinct feedbacks than this may have bound < beta (candidates
+	// one less), and each must have at least two.
+	const int lo = left == 2 ? n - 1 : std::max(1, 3 * n - 1 - beta);
+	bool settled = false;
+	auto take = [&](int g, int distinct) {
+		const int in = (int)(sc.cand[g >> 6] >> (g & 63) & 1);
+		const int lb = 3 * n - in - distinct;
+		if (lb == 2 * n && (!in || left >= 3)) settled = true;
+		else if (left >= 3 && lb < beta) sc.raw.push_back({ lb, g });
+	};
+#ifdef __AVX512BW__
+	if (n <= VEC_MAX)
+	{
+		for (int j = 0; j < n; j++) sc.rows[j] = t.prow(s[j]);
+		const __m512i vlo = _mm512_set1_epi8((char)lo);
+		alignas(64) uint8_t c8[64];
+		for (int b = 0; b < W && !settled; b++)
+		{
+			if (!allow[b]) continue;
+			const __m512i cnt = distinct64(sc.rows, (size_t)b * 64, n, sc.buf);
+			uint64_t sel = _mm512_cmpgt_epu8_mask(cnt, vlo) & allow[b];
+			if (!sel) continue;
+			_mm512_store_si512(c8, cnt);
+			for (; sel && !settled; sel &= sel - 1)
+			{
+				const int l = std::countr_zero(sel);
+				take(b * 64 + l, c8[l]);
+			}
+		}
+	}
+	else
+#endif
+	{
+		for (int b = 0; b < W && !settled; b++)
+			for (uint64_t m = allow[b]; m && !settled; m &= m - 1)
+			{
+				const int g = b * 64 + std::countr_zero(m);
+				const uint8_t * row = eng_.row(g);
+				uint64_t seen[4] = { 0, 0, 0, 0 };
+				for (int j = 0; j < n; j++)
+				{
+					const uint8_t f = row[s[j]];
+					seen[f >> 6] |= 1ull << (f & 63);
+				}
+				const int distinct = std::popcount(seen[0]) + std::popcount(seen[1]) + std::popcount(seen[2]) + std::popcount(seen[3]);
+				if (distinct > lo) take(g, distinct);
+			}
+	}
+	if (settled)
+	{
+		memo_->put(key, { 2 * n, true });
+		return 2 * n;
+	}
+	if (left == 2)
+	{
+		memo_->put(key, { INF, true });
+		return INF;
+	}
+
+	// Counting sort by bound, ties in guess order. Bounds lie in [2n-1, 3n-2].
+	const int lb0 = 2 * n - 1;
+	sc.bucket.assign(n + 1, 0);
+	for (const RawOpt & o : sc.raw) sc.bucket[o.lb - lb0]++;
+	for (int i = 0, sum = 0; i <= n; i++) { const int c = sc.bucket[i]; sc.bucket[i] = sum; sum += c; }
+	std::vector<Opt> opts(sc.raw.size());
+	for (const RawOpt & o : sc.raw) opts[sc.bucket[o.lb - lb0]++] = { o.lb, o.g };
 
 	int best = beta;
 	if (n < SHARE_MIN || threads_ == 1)
