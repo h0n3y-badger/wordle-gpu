@@ -1,6 +1,7 @@
 #include "exact.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -30,6 +31,9 @@ struct Hist
 };
 
 thread_local Hist tl_hist;
+
+// Nodes with at least this many candidates share their options with idle threads.
+constexpr int SHARE_MIN = 24;
 
 std::string make_key(const uint16_t * s, int n, int left, const HardRule * rule)
 {
@@ -105,7 +109,6 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 		}
 	}
 
-	struct Opt { int lb, g; };
 	std::vector<Opt> opts;
 	const int G = eng_.num_guesses();
 	for (int g = 0; g < G; g++)
@@ -124,44 +127,113 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	std::sort(opts.begin(), opts.end(), [](const Opt & a, const Opt & b) { return a.lb < b.lb; });
 
 	int best = beta;
-	std::vector<uint16_t> part(n);
-	std::vector<std::pair<int, int>> groups; // (size, pattern)
-	int start[NPAT];
-	for (const Opt & o : opts)
+	if (n < SHARE_MIN || threads_ == 1)
 	{
-		if (o.lb >= best) break;
-		const uint8_t * row = eng_.row(o.g);
-		h.reset();
-		for (int j = 0; j < n; j++) h.add(row[s[j]]);
-		groups.clear();
-		for (int k = 0; k < h.nused; k++)
-			if (h.used[k] != ALL_GREEN) groups.push_back({ h.cnt[h.used[k]], h.used[k] });
-		// Largest groups first: they decide whether the bound is beaten.
-		std::sort(groups.begin(), groups.end(), std::greater<>());
-		int at = 0;
-		for (auto [size, pat] : groups) { start[pat] = at; at += size; }
-		for (int j = 0; j < n; j++)
+		for (const Opt & o : opts)
 		{
-			const uint8_t f = row[s[j]];
-			if (f != ALL_GREEN) part[start[f]++] = s[j];
+			if (o.lb >= best) break;
+			best = std::min(best, try_option(s, n, left, rule, o, best));
 		}
-
-		int total = n, rest = o.lb - n;
-		bool ok = true;
-		at = 0;
-		for (auto [size, pat] : groups)
+	}
+	else
+	{
+		// Big node: let idle threads take options too, all pruning against one best.
+		Shared sh{ s, n, left, &rule, &opts };
+		sh.best = beta;
 		{
-			rest -= 2 * size - 1;
-			HardRule sub = rule;
-			if (hard_) sub.add(words[o.g].data(), pat);
-			total += solve(part.data() + at, size, left - 1, sub, best - total - rest);
-			at += size;
-			if (total + rest >= best) { ok = false; break; }
+			std::lock_guard<std::mutex> lock(shared_mu_);
+			shared_.push_back(&sh);
 		}
-		if (ok) best = total;
+		struct Leave
+		{
+			ExactSolver & x;
+			Shared & sh;
+			~Leave()
+			{
+				std::unique_lock<std::mutex> lock(x.shared_mu_);
+				x.shared_.erase(std::find(x.shared_.begin(), x.shared_.end(), &sh));
+				x.shared_cv_.wait(lock, [&] { return sh.helpers == 0; });
+			}
+		} leave{ *this, sh };
+		work_on(sh);
+		best = sh.best;
 	}
 	memo_->put(key, { best, best < beta });
 	return best;
+}
+
+int ExactSolver::try_option(const uint16_t * s, int n, int left, const HardRule & rule, const Opt & o, int best)
+{
+	Hist & h = tl_hist;
+	const uint8_t * row = eng_.row(o.g);
+	h.reset();
+	for (int j = 0; j < n; j++) h.add(row[s[j]]);
+	std::vector<std::pair<int, int>> groups; // (size, pattern)
+	for (int k = 0; k < h.nused; k++)
+		if (h.used[k] != ALL_GREEN) groups.push_back({ h.cnt[h.used[k]], h.used[k] });
+	// Largest groups first: they decide whether the bound is beaten.
+	std::sort(groups.begin(), groups.end(), std::greater<>());
+	int start[NPAT];
+	int at = 0;
+	for (auto [size, pat] : groups) { start[pat] = at; at += size; }
+	std::vector<uint16_t> part(at);
+	for (int j = 0; j < n; j++)
+	{
+		const uint8_t f = row[s[j]];
+		if (f != ALL_GREEN) part[start[f]++] = s[j];
+	}
+
+	int total = n, rest = o.lb - n;
+	at = 0;
+	for (auto [size, pat] : groups)
+	{
+		rest -= 2 * size - 1;
+		HardRule sub = rule;
+		if (hard_) sub.add(eng_.words()[o.g].data(), pat);
+		total += solve(part.data() + at, size, left - 1, sub, best - total - rest);
+		at += size;
+		if (total + rest >= best) return best;
+	}
+	return total;
+}
+
+void ExactSolver::work_on(Shared & sh)
+{
+	const size_t count = sh.opts->size();
+	for (size_t i; (i = sh.next++) < count;)
+	{
+		const Opt & o = (*sh.opts)[i];
+		const int best = sh.best.load();
+		// Options are sorted by bound, so none after this one can win either.
+		if (o.lb >= best) { sh.next = count; break; }
+		const int t = try_option(sh.s, sh.n, sh.left, *sh.rule, o, best);
+		for (int cur = sh.best.load(); t < cur && !sh.best.compare_exchange_weak(cur, t);) {}
+	}
+}
+
+bool ExactSolver::help()
+{
+	Shared * sh = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(shared_mu_);
+		// The biggest node has the longest options left.
+		for (Shared * x : shared_)
+			if (x->next < x->opts->size() && (!sh || x->n > sh->n)) sh = x;
+		if (!sh) return false;
+		sh->helpers++;
+	}
+	struct Done
+	{
+		ExactSolver & x;
+		Shared * sh;
+		~Done()
+		{
+			std::lock_guard<std::mutex> lock(x.shared_mu_);
+			if (--sh->helpers == 0) x.shared_cv_.notify_all();
+		}
+	} done{ *this, sh };
+	work_on(*sh);
+	return true;
 }
 
 bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<int> & g1s, int left,
@@ -198,15 +270,23 @@ bool ExactSolver::totals(const std::vector<uint16_t> & cands, const std::vector<
 	auto work = [&] {
 		try
 		{
-			for (size_t t; (t = next++) < tasks.size();)
+			for (;;)
 			{
-				results[t] = solve(tasks[t].set.data(), (int)tasks[t].set.size(), left - 1, tasks[t].rule, INF);
-				const size_t d = ++done;
-				if (progress)
+				const size_t t = next++;
+				if (t < tasks.size())
 				{
-					std::lock_guard<std::mutex> lock(progress_mu);
-					progress((double)d / tasks.size());
+					results[t] = solve(tasks[t].set.data(), (int)tasks[t].set.size(), left - 1, tasks[t].rule, INF);
+					const size_t d = ++done;
+					if (progress)
+					{
+						std::lock_guard<std::mutex> lock(progress_mu);
+						progress((double)d / tasks.size());
+					}
+					continue;
 				}
+				// Out of tasks: help the ones still running until they are all done.
+				if (cancelled || done == tasks.size()) break;
+				if (!help()) std::this_thread::sleep_for(std::chrono::microseconds(200));
 			}
 		}
 		catch (const Cancelled &) { cancelled = true; }

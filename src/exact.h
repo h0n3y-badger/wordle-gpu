@@ -5,8 +5,10 @@
 #include "engine.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 constexpr int INF = 1 << 24;
@@ -29,6 +31,27 @@ public:
 
 private:
 	struct Memo;
+	struct Opt { int lb, g; };
+	// A node whose options any idle thread may help evaluate.
+	struct Shared
+	{
+		const uint16_t * s;
+		int n, left;
+		const HardRule * rule;
+		const std::vector<Opt> * opts;
+		std::atomic<size_t> next{ 0 };
+		std::atomic<int> best;
+		int helpers = 0; // guarded by shared_mu_
+	};
+
+	// Total for guessing o.g at this node, or `best` if it can't beat best.
+	int try_option(const uint16_t * s, int n, int left, const HardRule & rule, const Opt & o, int best);
+	void work_on(Shared & sh);
+	bool help(); // false if no node needs help
+
+	std::mutex shared_mu_;
+	std::condition_variable shared_cv_;
+	std::vector<Shared *> shared_;
 	const Engine & eng_;
 	bool hard_;
 	int threads_;
