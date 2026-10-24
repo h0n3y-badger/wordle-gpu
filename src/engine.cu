@@ -14,19 +14,21 @@
 
 constexpr int BD = 256;             // threads per block in every kernel
 constexpr double LAUNCH_MS = 25;    // target length of one lookahead launch
-constexpr int DEPTH = 8;            // table loads in flight per thread in lookahead_kernel
+
+// Row stride of the pool-major table: a multiple of 128 bytes, padded with zeros.
+static int padded(int G) { return (G + 127) & ~127; }
 
 // Feedback for every (answer, guess) pair, in both layouts: pool-major for the
 // lookahead kernel (a warp reads 32 neighbouring guesses for one answer) and
 // guess-major for the stats kernel and the host.
 __global__ void table_kernel(const char * __restrict__ words, const int * __restrict__ pool,
-	int G, int P, uint8_t * pt, uint8_t * tt)
+	int G, int GP, int P, uint8_t * pt, uint8_t * tt)
 {
 	const int g = blockIdx.x * blockDim.x + threadIdx.x;
 	const int p = blockIdx.y;
 	if (g >= G) return;
 	const uint8_t f = feedback(words + 5 * g, words + 5 * pool[p]);
-	pt[(size_t)p * G + g] = f;
+	pt[(size_t)p * GP + g] = f;
 	tt[(size_t)g * P + p] = f;
 }
 
@@ -78,39 +80,75 @@ __global__ void __launch_bounds__(BD) stats_kernel(const uint8_t * __restrict__ 
 		out[blockIdx.x] = { buckets, largest, sum_sq, log2f((float)n) - clogc / n, hist[ALL_GREEN] > 0 };
 }
 
+// Second guesses per thread in lookahead_kernel: adjacent bytes of a table row, read as one word.
+constexpr int LV = 4;
+// Members whose table words are in flight at once per thread.
+constexpr int DEPTH = 8;
+
 // Blocks (x, y) take first guess x and the y-th slice of second guesses. The candidates
 // are grouped by their feedback to the first guess; for every group of 3+ each thread
-// tries second guesses, counting the distinct feedbacks in a 243-bit set held in its own
-// column of shared memory. Per-group maxima over the slices meet in best_d / best_k.
+// tries LV adjacent second guesses at once, counting the distinct feedbacks of each in a
+// 243-bit set held in its own columns of shared memory. Per-group maxima over the slices
+// meet in best_d / best_k. Rows of pt are GP bytes (a multiple of 128) and slices are
+// multiples of 32 quads, so a warp reads one aligned 128-byte line per member.
+
+// Set the bits for one member's four patterns. The four sets are disjoint, so all four
+// words are read before any is written.
+// mul is LV * BD * 4 / 32 = 128, passed in so the compiler keeps (q & 0xe0) * mul + base
+// as LOP3 + IMAD (FMA pipe) instead of SHF + LOP3 + IADD (all on the ALU pipe).
+__device__ __forceinline__ void set4(uint32_t * mybits, uint32_t v, uint32_t mul)
+{
+	// Byte k of v is the pattern q of second guess k; the word holding bit q is q >> 5 at a
+	// stride of LV * BD words, i.e. (q & 0xe0) * 128 bytes. Shifts by y use its low 5 bits.
+	const uint32_t y1 = v >> 8, y2 = v >> 16, y3 = v >> 24;
+	char * base = (char *)mybits;
+	uint32_t * a0 = (uint32_t *)(base + (v & 0xe0) * mul);
+	uint32_t * a1 = (uint32_t *)(base + (y1 & 0xe0) * mul) + BD;
+	uint32_t * a2 = (uint32_t *)(base + (y2 & 0xe0) * mul) + 2 * BD;
+	uint32_t * a3 = (uint32_t *)(base + (y3 & 0xe0) * mul) + 3 * BD;
+#ifdef USE_ATOMS
+	// Fire-and-forget shared atomics: no load-to-store chain between members.
+	atomicOr(a0, 1u << (v & 31));
+	atomicOr(a1, 1u << (y1 & 31));
+	atomicOr(a2, 1u << (y2 & 31));
+	atomicOr(a3, 1u << (y3 & 31));
+#else
+	const uint32_t w0 = *a0, w1 = *a1, w2 = *a2, w3 = *a3;
+	*a0 = w0 | 1u << (v & 31);
+	*a1 = w1 | 1u << (y1 & 31);
+	*a2 = w2 | 1u << (y2 & 31);
+	*a3 = w3 | 1u << (y3 & 31);
+#endif
+}
+
 template <bool HARD>
-__global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restrict__ pt, int G,
+__global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restrict__ pt, int G, int GP, int per,
 	const char * __restrict__ words, const uint16_t * __restrict__ cands, int n,
 	const int * __restrict__ g1s, const int * __restrict__ g2cand, HardRule base,
 	int * group_size, int * best_d, int * best_k)
 {
 	extern __shared__ uint32_t smem[];
-	uint32_t * bits = smem;                              // [8][BD]
-	int * counts = (int *)(bits + 8 * BD);               // [256]
+	uint32_t * bits = smem;                              // [8][LV][BD]
+	int * counts = (int *)(bits + 8 * LV * BD);          // [256]
 	int * starts = counts + 256;                         // [256]
-	int * scratch = starts + 256;                        // [BD/32]
-	uint16_t * members = (uint16_t *)(scratch + BD / 32); // [n] pool indices grouped by feedback
+	int * scratch = starts + 256;                        // [2][BD/32]
+	uint16_t * members = (uint16_t *)(scratch + 2 * BD / 32); // [n] pool indices grouped by feedback
 	uint8_t * pat1 = (uint8_t *)(members + n);           // [n] feedback of each candidate
 	__shared__ int perfect;
 
-	const int tid = threadIdx.x;
+	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 	const int g1 = g1s[blockIdx.x];
-	const int slice = (G + gridDim.y - 1) / gridDim.y;
-	const int g2_lo = blockIdx.y * slice, g2_hi = min(G, g2_lo + slice);
+	const int quads = GP / LV;
+	const int q_lo = blockIdx.y * per, q_hi = min(quads, q_lo + per);
 	group_size += blockIdx.x * NPAT;
 	best_d += blockIdx.x * NPAT;
 	best_k += blockIdx.x * NPAT;
 
 	for (int i = tid; i < 256; i += BD) counts[i] = 0;
-	if (tid == 0) perfect = 0;
 	__syncthreads();
 	for (int i = tid; i < n; i += BD)
 	{
-		const uint8_t f = pt[(uint32_t)cands[i] * G + g1];
+		const uint8_t f = pt[(uint32_t)cands[i] * GP + g1];
 		pat1[i] = f;
 		atomicAdd(&counts[f], 1);
 	}
@@ -139,70 +177,87 @@ __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restric
 		// Groups of 1 or 2 are split perfectly by guessing one of their words.
 		if (s < 3) continue;
 		// Another slice may already have split this group perfectly. Thread 0 decides for
-		// the whole block so every thread reaches the same barriers.
+		// the whole block so every thread reaches the same barriers. This barrier also
+		// keeps the previous group's scratch until thread 0 has read it.
 		if (tid == 0) perfect = *(volatile int *)&best_k[p] == s + 1;
 		__syncthreads();
 
 		HardRule rule = base;
 		if (HARD) rule.add(words + 5 * g1, p);
 		const uint16_t * mem = members + starts[p];
+		const uint32_t mul = LV * BD * 4 / 32 + (GP >> 30); // GP < 2^30: just hides the constant
 		int bd = 0, bk = 0;
-		for (int g2 = g2_lo + tid; g2 < g2_hi; g2 += BD)
+		for (int qd = q_lo + tid; qd < q_hi; qd += BD)
 		{
 			if (*(volatile int *)&perfect) break;
-			if (HARD && !rule.allows(words + 5 * g2)) continue;
+			const int g2 = qd * LV;
+			unsigned ok = 0; // bit k: g2 + k is a word, and one the rules allow
 #pragma unroll
-			for (int w = 0; w < 8; w++) mybits[w * BD] = 0;
-			// The bit stores might alias the member list as far as the compiler knows, so
-			// written as one loop each member's table load waits for the previous member's
-			// bits: one load in flight per thread. Fetch the next DEPTH members' patterns
-			// before setting the bits of these. The tests on j + u < s are block-uniform.
-			const uint8_t * col = pt + g2;
-			uint32_t q[DEPTH], nq[DEPTH];
+			for (int k = 0; k < LV; k++)
+				if (g2 + k < G && (!HARD || rule.allows(words + 5 * (g2 + k)))) ok |= 1u << k;
+			if (!ok) continue;
 #pragma unroll
-			for (int u = 0; u < DEPTH; u++) q[u] = u < s ? col[(uint32_t)mem[u] * G] : 0;
+			for (int w = 0; w < 8 * LV; w++) mybits[w * BD] = 0;
+			// Fetch the next DEPTH members' patterns before setting the bits of these: the bit
+			// stores might alias the member list as far as the compiler knows, so it will not
+			// hoist loads past them itself. All tests on j and s are block-uniform.
+			const uint32_t * col = (const uint32_t *)pt + qd;
+			const uint32_t stride = GP / 4;
+			uint32_t v[DEPTH], nx[DEPTH];
+#pragma unroll
+			for (int u = 0; u < DEPTH; u++) v[u] = u < s ? col[mem[u] * stride] : 0;
 			int j = 0;
 			for (; j + 2 * DEPTH <= s; j += DEPTH) // the next batch is full
 			{
 #pragma unroll
-				for (int u = 0; u < DEPTH; u++) nq[u] = col[(uint32_t)mem[j + DEPTH + u] * G];
+				for (int u = 0; u < DEPTH; u++) nx[u] = col[mem[j + DEPTH + u] * stride];
 #pragma unroll
-				for (int u = 0; u < DEPTH; u++) mybits[(q[u] >> 5) * BD] |= 1u << (q[u] & 31);
+				for (int u = 0; u < DEPTH; u++) set4(mybits, v[u], mul);
 #pragma unroll
-				for (int u = 0; u < DEPTH; u++) q[u] = nq[u];
+				for (int u = 0; u < DEPTH; u++) v[u] = nx[u];
 			}
 			if (j + DEPTH < s) // a partial batch follows
 			{
 #pragma unroll
-				for (int u = 0; u < DEPTH; u++)
-					nq[u] = j + DEPTH + u < s ? col[(uint32_t)mem[j + DEPTH + u] * G] : 0;
+				for (int u = 0; u < DEPTH; u++) nx[u] = j + DEPTH + u < s ? col[mem[j + DEPTH + u] * stride] : 0;
 #pragma unroll
-				for (int u = 0; u < DEPTH; u++) mybits[(q[u] >> 5) * BD] |= 1u << (q[u] & 31);
+				for (int u = 0; u < DEPTH; u++) set4(mybits, v[u], mul);
 #pragma unroll
-				for (int u = 0; u < DEPTH; u++) q[u] = nq[u];
+				for (int u = 0; u < DEPTH; u++) v[u] = nx[u];
 				j += DEPTH;
 			}
 #pragma unroll
 			for (int u = 0; u < DEPTH; u++)
-				if (j + u < s) mybits[(q[u] >> 5) * BD] |= 1u << (q[u] & 31);
-			int d = 0;
+				if (j + u < s) set4(mybits, v[u], mul);
+			const int4 c4 = *(const int4 *)(g2cand + g2);
+			const int cs[LV] = { c4.x, c4.y, c4.z, c4.w };
 #pragma unroll
-			for (int w = 0; w < 8; w++) d += __popc(mybits[w * BD]);
-			const int c = g2cand[g2];
-			const int k = d + (c >= 0 && pat1[c] == p);
-			bd = max(bd, d);
-			bk = max(bk, k);
-			if (k == s + 1) perfect = 1;
+			for (int k = 0; k < LV; k++)
+			{
+				int d = 0;
+#pragma unroll
+				for (int w = 0; w < 8; w++) d += __popc(mybits[(w * LV + k) * BD]);
+				if (!(ok >> k & 1)) continue;
+				const int c = cs[k];
+				const int kk = d + (c >= 0 && pat1[c] == p);
+				bd = max(bd, d);
+				bk = max(bk, kk);
+				if (kk == s + 1) perfect = 1;
+			}
 		}
-		bd = block_reduce(bd, Max(), scratch);
-		bk = block_reduce(bk, Max(), scratch);
+		for (int o = 16; o > 0; o >>= 1)
+		{
+			bd = max(bd, __shfl_xor_sync(0xffffffff, bd, o));
+			bk = max(bk, __shfl_xor_sync(0xffffffff, bk, o));
+		}
+		if (lane == 0) { scratch[warp] = bd; scratch[BD / 32 + warp] = bk; }
+		__syncthreads();
 		if (tid == 0)
 		{
+			for (int w = 1; w < BD / 32; w++) { bd = max(bd, scratch[w]); bk = max(bk, scratch[BD / 32 + w]); }
 			atomicMax(&best_d[p], bd);
 			atomicMax(&best_k[p], bk);
-			perfect = 0;
 		}
-		__syncthreads();
 	}
 }
 
@@ -282,14 +337,16 @@ Engine::Engine(std::vector<std::string> words, std::vector<int> pool, int device
 	dev_->words.upload(flat);
 	DevBuf<int> dpool;
 	dpool.upload(pool_);
-	dev_->pt.reserve((size_t)G * P);
+	const int GP = padded(G);
+	dev_->pt.reserve((size_t)GP * P);
 	dev_->tt.reserve((size_t)G * P);
-	table_kernel<<<dim3((G + BD - 1) / BD, P), BD>>>(dev_->words.p, dpool.p, G, P, dev_->pt.p, dev_->tt.p);
+	CUDA_CHECK(cudaMemset(dev_->pt.p, 0, (size_t)GP * P));
+	table_kernel<<<dim3((G + BD - 1) / BD, P), BD>>>(dev_->words.p, dpool.p, G, GP, P, dev_->pt.p, dev_->tt.p);
 	CUDA_CHECK(cudaGetLastError());
 	table_.resize((size_t)G * P);
 	CUDA_CHECK(cudaMemcpy(table_.data(), dev_->tt.p, table_.size(), cudaMemcpyDeviceToHost));
 
-	const size_t max_smem = (8 * BD + 512 + BD / 32) * 4 + 3 * (size_t)P;
+	const size_t max_smem = (8 * LV * BD + 512 + 2 * BD / 32) * 4 + 3 * (size_t)P;
 	CUDA_CHECK(cudaFuncSetAttribute(lookahead_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_smem));
 	CUDA_CHECK(cudaFuncSetAttribute(lookahead_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_smem));
 }
@@ -309,7 +366,7 @@ const uint8_t * Engine::pool_major(size_t & stride) const
 		pm_.reset(p);
 		for (size_t i = 0; i < P; i++) std::fill(p + i * st + G, p + (i + 1) * st, 0);
 		std::lock_guard<std::mutex> lock(dev_->mu);
-		CUDA_CHECK(cudaMemcpy2D(p, st, dev_->pt.p, G, G, P, cudaMemcpyDeviceToHost));
+		CUDA_CHECK(cudaMemcpy2D(p, st, dev_->pt.p, padded((int)G), G, P, cudaMemcpyDeviceToHost));
 		pm_stride_ = st;
 	});
 	stride = pm_stride_;
@@ -339,7 +396,8 @@ bool Engine::lookahead(const std::vector<uint16_t> & cands, const std::vector<in
 	if (g1s.empty() || cands.empty()) return true;
 	const int G = num_guesses(), n = (int)cands.size();
 
-	std::vector<int> g2cand(G, -1);
+	const int GP = padded(G);
+	std::vector<int> g2cand(GP, -1);
 	for (int i = 0; i < n; i++) g2cand[pool_[cands[i]]] = i;
 
 	std::lock_guard<std::mutex> lock(dev_->mu);
@@ -348,12 +406,16 @@ bool Engine::lookahead(const std::vector<uint16_t> & cands, const std::vector<in
 	d.guesses.upload(g1s);
 	d.g2cand.upload(g2cand);
 	d.look.reserve(g1s.size());
-	const size_t smem = (8 * BD + 512 + BD / 32) * 4 + 3 * (size_t)n;
+	const size_t smem = (8 * LV * BD + 512 + 2 * BD / 32) * 4 + 3 * (size_t)n;
 	const HardRule base = hard ? *hard : HardRule();
 
 	// Split each first guess over enough blocks that one block takes about a millisecond,
 	// then size batches so a launch takes about LAUNCH_MS.
-	const int slices = (int)std::clamp<size_t>((size_t)n * G / 1000000, 1, 64);
+	// Slices are whole warps of quads (32 quads = one 128-byte line per member).
+	const int quads = GP / LV;
+	const int want = (int)std::clamp<size_t>((size_t)n * G / (LV * 1000000), 1, 64);
+	const int per = ((quads + want - 1) / want + 31) & ~31;
+	const int slices = (quads + per - 1) / per;
 	size_t batch = std::max(1, 4096 / slices);
 	for (size_t at = 0; at < g1s.size();)
 	{
@@ -367,10 +429,10 @@ bool Engine::lookahead(const std::vector<uint16_t> & cands, const std::vector<in
 		CUDA_CHECK(cudaEventRecord(d.start));
 		const dim3 grid((unsigned)cnt, slices);
 		if (hard)
-			lookahead_kernel<true><<<grid, BD, smem>>>(d.pt.p, G, d.words.p, d.cands.p, n,
+			lookahead_kernel<true><<<grid, BD, smem>>>(d.pt.p, G, GP, per, d.words.p, d.cands.p, n,
 				d.guesses.p + at, d.g2cand.p, base, d.group_size.p, d.best_d.p, d.best_k.p);
 		else
-			lookahead_kernel<false><<<grid, BD, smem>>>(d.pt.p, G, d.words.p, d.cands.p, n,
+			lookahead_kernel<false><<<grid, BD, smem>>>(d.pt.p, G, GP, per, d.words.p, d.cands.p, n,
 				d.guesses.p + at, d.g2cand.p, base, d.group_size.p, d.best_d.p, d.best_k.p);
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaEventRecord(d.stop));
