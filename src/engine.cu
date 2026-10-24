@@ -76,13 +76,15 @@ __global__ void __launch_bounds__(BD) stats_kernel(const uint8_t * __restrict__ 
 		out[blockIdx.x] = { buckets, largest, sum_sq, log2f((float)n) - clogc / n, hist[ALL_GREEN] > 0 };
 }
 
-// One block per first guess. The candidates are grouped by their feedback; for every
-// group of 3+ each thread tries second guesses, counting the distinct feedbacks in a
-// 243-bit set held in its own column of shared memory.
+// Blocks (x, y) take first guess x and the y-th slice of second guesses. The candidates
+// are grouped by their feedback to the first guess; for every group of 3+ each thread
+// tries second guesses, counting the distinct feedbacks in a 243-bit set held in its own
+// column of shared memory. Per-group maxima over the slices meet in best_d / best_k.
 template <bool HARD>
 __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restrict__ pt, int G,
 	const char * __restrict__ words, const uint16_t * __restrict__ cands, int n,
-	const int * __restrict__ g1s, const int * __restrict__ g2cand, HardRule base, Lookahead * out)
+	const int * __restrict__ g1s, const int * __restrict__ g2cand, HardRule base,
+	int * group_size, int * best_d, int * best_k)
 {
 	extern __shared__ uint32_t smem[];
 	uint32_t * bits = smem;                              // [8][BD]
@@ -95,6 +97,11 @@ __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restric
 
 	const int tid = threadIdx.x;
 	const int g1 = g1s[blockIdx.x];
+	const int slice = (G + gridDim.y - 1) / gridDim.y;
+	const int g2_lo = blockIdx.y * slice, g2_hi = min(G, g2_lo + slice);
+	group_size += blockIdx.x * NPAT;
+	best_d += blockIdx.x * NPAT;
+	best_k += blockIdx.x * NPAT;
 
 	for (int i = tid; i < 256; i += BD) counts[i] = 0;
 	if (tid == 0) perfect = 0;
@@ -112,29 +119,31 @@ __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restric
 		for (int i = 0; i < 256; i++) { starts[i] = acc; acc += counts[i]; }
 	}
 	__syncthreads();
-	// Use counts as cursors while scattering, then restore them from starts.
+	// Use starts as cursors while scattering, then restore them from counts.
 	for (int i = tid; i < n; i += BD)
 		members[atomicAdd(&starts[pat1[i]], 1)] = cands[i];
 	__syncthreads();
-	for (int i = tid; i < NPAT; i += BD) starts[i] -= counts[i];
+	for (int i = tid; i < NPAT; i += BD)
+	{
+		starts[i] -= counts[i];
+		if (blockIdx.y == 0) group_size[i] = counts[i];
+	}
 	__syncthreads();
 
-	int total = 0, by3 = 0; // only thread 0's copy is used
-	if (counts[ALL_GREEN]) total = by3 = 1;
 	uint32_t * mybits = bits + tid;
-
 	for (int p = 0; p < ALL_GREEN; p++)
 	{
 		const int s = counts[p];
-		if (s == 0) continue;
 		// Groups of 1 or 2 are split perfectly by guessing one of their words.
-		if (s < 3) { total += 4 * s - (s + 1); by3 += s; continue; }
+		if (s < 3) continue;
+		// Another slice may already have split this group perfectly.
+		if (*(volatile int *)&best_k[p] == s + 1) continue;
 
 		HardRule rule = base;
 		if (HARD) rule.add(words + 5 * g1, p);
 		const uint16_t * mem = members + starts[p];
-		int best_d = 0, best_k = 0;
-		for (int g2 = tid; g2 < G; g2 += BD)
+		int bd = 0, bk = 0;
+		for (int g2 = g2_lo + tid; g2 < g2_hi; g2 += BD)
 		{
 			if (*(volatile int *)&perfect) break;
 			if (HARD && !rule.allows(words + 5 * g2)) continue;
@@ -151,21 +160,43 @@ __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restric
 			for (int w = 0; w < 8; w++) d += __popc(mybits[w * BD]);
 			const int c = g2cand[g2];
 			const int k = d + (c >= 0 && pat1[c] == p);
-			best_d = max(best_d, d);
-			best_k = max(best_k, k);
+			bd = max(bd, d);
+			bk = max(bk, k);
 			if (k == s + 1) perfect = 1;
 		}
-		best_d = block_reduce(best_d, Max(), scratch);
-		best_k = block_reduce(best_k, Max(), scratch);
-		// Each word spends guesses 1 and 2; a group of s left after that needs at least
-		// 2s-1 more, and the second guess itself, if it was the answer, needs none.
-		total += 4 * s - best_k;
-		by3 += best_d;
-		__syncthreads();
-		if (tid == 0) perfect = 0;
+		bd = block_reduce(bd, Max(), scratch);
+		bk = block_reduce(bk, Max(), scratch);
+		if (tid == 0)
+		{
+			atomicMax(&best_d[p], bd);
+			atomicMax(&best_k[p], bk);
+			perfect = 0;
+		}
 		__syncthreads();
 	}
-	if (tid == 0) out[blockIdx.x] = { total, by3 };
+}
+
+// One thread per first guess: add up the groups.
+__global__ void lookahead_sum(int count, const int * __restrict__ group_size, const int * __restrict__ best_d,
+	const int * __restrict__ best_k, Lookahead * out)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= count) return;
+	const int * size = group_size + i * NPAT;
+	int total = 0, by3 = 0;
+	if (size[ALL_GREEN]) total = by3 = 1;
+	for (int p = 0; p < ALL_GREEN; p++)
+	{
+		const int s = size[p];
+		if (s == 0) continue;
+		const int d = s < 3 ? s : best_d[i * NPAT + p];
+		const int k = s < 3 ? s + 1 : best_k[i * NPAT + p];
+		// Each word spends guesses 1 and 2; a group of s left after that needs at least
+		// 2s-1 more, and the second guess itself, if it was the answer, needs none.
+		total += 4 * s - k;
+		by3 += d;
+	}
+	out[i] = { total, by3 };
 }
 
 template <typename T>
@@ -198,6 +229,7 @@ struct Engine::Device
 	DevBuf<int> guesses, g2cand;
 	DevBuf<GuessStats> stats;
 	DevBuf<Lookahead> look;
+	DevBuf<int> group_size, best_d, best_k;
 	cudaEvent_t start, stop;
 };
 
@@ -273,29 +305,40 @@ bool Engine::lookahead(const std::vector<uint16_t> & cands, const std::vector<in
 	const size_t smem = (8 * BD + 512 + BD / 32) * 4 + 3 * (size_t)n;
 	const HardRule base = hard ? *hard : HardRule();
 
-	// Grow the batch until a launch takes about LAUNCH_MS.
-	size_t batch = 64;
+	// Split each first guess over enough blocks that one block takes about a millisecond,
+	// then size batches so a launch takes about LAUNCH_MS.
+	const int slices = (int)std::clamp<size_t>((size_t)n * G / 1000000, 1, 64);
+	size_t batch = std::max(1, 4096 / slices);
 	for (size_t at = 0; at < g1s.size();)
 	{
 		if (cancel && cancel->load()) return false;
 		const size_t cnt = std::min(batch, g1s.size() - at);
+		d.group_size.reserve(cnt * NPAT);
+		d.best_d.reserve(cnt * NPAT);
+		d.best_k.reserve(cnt * NPAT);
+		CUDA_CHECK(cudaMemsetAsync(d.best_d.p, 0, cnt * NPAT * sizeof(int)));
+		CUDA_CHECK(cudaMemsetAsync(d.best_k.p, 0, cnt * NPAT * sizeof(int)));
 		CUDA_CHECK(cudaEventRecord(d.start));
+		const dim3 grid((unsigned)cnt, slices);
 		if (hard)
-			lookahead_kernel<true><<<cnt, BD, smem>>>(d.pt.p, G, d.words.p, d.cands.p, n,
-				d.guesses.p + at, d.g2cand.p, base, d.look.p + at);
+			lookahead_kernel<true><<<grid, BD, smem>>>(d.pt.p, G, d.words.p, d.cands.p, n,
+				d.guesses.p + at, d.g2cand.p, base, d.group_size.p, d.best_d.p, d.best_k.p);
 		else
-			lookahead_kernel<false><<<cnt, BD, smem>>>(d.pt.p, G, d.words.p, d.cands.p, n,
-				d.guesses.p + at, d.g2cand.p, base, d.look.p + at);
+			lookahead_kernel<false><<<grid, BD, smem>>>(d.pt.p, G, d.words.p, d.cands.p, n,
+				d.guesses.p + at, d.g2cand.p, base, d.group_size.p, d.best_d.p, d.best_k.p);
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaEventRecord(d.stop));
+		lookahead_sum<<<(cnt + BD - 1) / BD, BD>>>((int)cnt, d.group_size.p, d.best_d.p, d.best_k.p, d.look.p + at);
+		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaEventSynchronize(d.stop));
 		float ms = 0;
 		CUDA_CHECK(cudaEventElapsedTime(&ms, d.start, d.stop));
 		at += cnt;
 		if (cnt == batch)
-			batch = std::clamp<size_t>((size_t)(batch * LAUNCH_MS / std::max(ms, 0.01f)), 1, std::max<size_t>(batch * 4, 1));
+			batch = std::clamp<size_t>((size_t)(batch * LAUNCH_MS / std::max(ms, 0.01f)), 64, batch * 2);
 		if (progress) progress((double)at / g1s.size());
 	}
+	CUDA_CHECK(cudaDeviceSynchronize());
 	CUDA_CHECK(cudaMemcpy(out.data(), d.look.p, out.size() * sizeof(Lookahead), cudaMemcpyDeviceToHost));
 	return true;
 }
