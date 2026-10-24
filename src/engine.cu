@@ -92,8 +92,8 @@ constexpr int DEPTH = 8;
 // meet in best_d / best_k. Rows of pt are GP bytes (a multiple of 128) and slices are
 // multiples of 32 quads, so a warp reads one aligned 128-byte line per member.
 
-// Set the bits for one member's four patterns. The four sets are disjoint, so all four
-// words are read before any is written.
+// Set the bits for one member's four patterns, with shared-memory atomics so nothing
+// waits on a load (measured faster than read-then-write on sm_120).
 // mul is LV * BD * 4 / 32 = 128, passed in so the compiler keeps (q & 0xe0) * mul + base
 // as LOP3 + IMAD (FMA pipe) instead of SHF + LOP3 + IADD (all on the ALU pipe).
 __device__ __forceinline__ void set4(uint32_t * mybits, uint32_t v, uint32_t mul)
@@ -106,19 +106,11 @@ __device__ __forceinline__ void set4(uint32_t * mybits, uint32_t v, uint32_t mul
 	uint32_t * a1 = (uint32_t *)(base + (y1 & 0xe0) * mul) + BD;
 	uint32_t * a2 = (uint32_t *)(base + (y2 & 0xe0) * mul) + 2 * BD;
 	uint32_t * a3 = (uint32_t *)(base + (y3 & 0xe0) * mul) + 3 * BD;
-#ifdef USE_ATOMS
 	// Fire-and-forget shared atomics: no load-to-store chain between members.
 	atomicOr(a0, 1u << (v & 31));
 	atomicOr(a1, 1u << (y1 & 31));
 	atomicOr(a2, 1u << (y2 & 31));
 	atomicOr(a3, 1u << (y3 & 31));
-#else
-	const uint32_t w0 = *a0, w1 = *a1, w2 = *a2, w3 = *a3;
-	*a0 = w0 | 1u << (v & 31);
-	*a1 = w1 | 1u << (y1 & 31);
-	*a2 = w2 | 1u << (y2 & 31);
-	*a3 = w3 | 1u << (y3 & 31);
-#endif
 }
 
 template <bool HARD>
