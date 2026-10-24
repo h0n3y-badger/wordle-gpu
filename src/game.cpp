@@ -155,6 +155,12 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 	out.played = (int)turns_.size();
 	out.cands = candidates();
 	const int n = (int)out.cands.size();
+	const bool won = !turns_.empty() && turns_.back().pat == ALL_GREEN;
+	if (n == 0 || won)
+	{
+		if (report) report(STATS, out);
+		return true;
+	}
 	const std::vector<int> guesses = guess_list();
 
 	std::vector<GuessStats> st;
@@ -171,7 +177,7 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 	}
 	sort_rows(out);
 	if (report) report(STATS, out);
-	if (n == 0 || out.rows.empty() || out.played >= MAX_GUESSES) return true;
+	if (out.rows.empty() || out.played >= MAX_GUESSES) return true;
 	auto stage_progress = [&](Stage s) {
 		return [&progress, s](double f) { if (progress) progress(s, f); };
 	};

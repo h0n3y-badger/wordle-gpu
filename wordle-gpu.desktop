@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wordle GPU Solver
+Comment=Brute-force the best next Wordle guess on the GPU
+Exec=wordle-gpu
+Icon=accessories-dictionary
+Terminal=false
+Categories=Game;LogicGame;
