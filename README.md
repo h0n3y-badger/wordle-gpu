@@ -9,23 +9,31 @@ answer still possible:
 1. **Split stats** (instant): colour-result groups, entropy, expected and
    worst-case answers left.
 2. **Two-ply brute force** (GPU): every first guess × every colour result ×
-   every second guess. From the opening that is 14,855 × 14,855 × 2,315 ≈ 5×10¹¹
-   feedback lookups, about 1.2 s on an RTX 5070 Ti. It gives each guess the
+   every second guess. From the opening that is 14,855 × 14,855 × 2,386 ≈ 5×10¹¹
+   feedback lookups, about 0.5 s on an RTX 5070 Ti. It gives each guess the
    chance of finishing within two more guesses, and a lower bound on its average
    score (exact for two guesses, then the best any strategy could do).
 3. **Exact solve** (CPU, branch and bound over all guesses at every node,
    pruned with the GPU's bounds): the true optimal average score, played
-   perfectly from here within six guesses. Once about 400 answers or fewer
-   remain it runs by itself and usually proves the best guess optimal in under
-   a second. From the opening it takes a few minutes.
+   perfectly from here within six guesses. Guesses that can't beat the best so
+   far are refuted rather than solved, so with up to 3,000 possible answers it
+   runs by itself and proves the best guess optimal. That takes about 0.9 s
+   from the opening, 2.5 s in hard mode, and milliseconds later in the game.
+   The "any valid word" opening (14,855 answers) is still too big to prove.
 
-The opening position is the same every game, so its exact results are kept
-in `~/.cache/wordle-gpu/` (one file per word lists, answer list and hard mode).
-After one proof run the GUI starts with the optimal opener already proven.
-`wordle-gpu-cli -C` ignores the cache.
+Rows marked "≥" are lower bounds: either nothing tighter was needed, or the
+guess was shown to be worse than the best.
 
-Opening result with these lists: **TARSE** is optimal at 3.4156 guesses on
-average (7907 total over the 2315 answers). Proving it took 4 min 50 s.
+Exact opening results are kept in `~/.cache/wordle-gpu/` (one file per word
+lists, answer list and hard mode); `wordle-gpu-cli -C` ignores the cache.
+
+Opening results (2026-10-24 lists):
+
+| Answers | Mode | Best opener | Average |
+|---|---|---|---|
+| original 2,315 | normal | TARSE | 3.4156 (7907 total) |
+| original + NYT picks, 2,386 | normal | TARSE | 3.4233 (8168) |
+| original + NYT picks, 2,386 | hard | LEAST (tied with SALET) | 3.5163 (8390) |
 
 ## Build
 

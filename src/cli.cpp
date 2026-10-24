@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 // Positions with at most this many possible answers are solved exactly in interactive mode.
-constexpr size_t AUTO_EXACT = 400;
+constexpr size_t AUTO_EXACT = 3000;
 
 static void usage(const char * argv0)
 {

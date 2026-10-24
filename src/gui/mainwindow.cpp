@@ -23,7 +23,7 @@
 #include <QVBoxLayout>
 
 // Positions with at most this many possible answers are solved exactly without asking.
-constexpr int AUTO_EXACT = 400;
+constexpr int AUTO_EXACT = 3000;
 
 MainWindow::MainWindow(WordLists lists, QWidget * parent) : QMainWindow(parent), lists_(std::move(lists))
 {
