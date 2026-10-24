@@ -14,6 +14,7 @@
 
 constexpr int BD = 256;             // threads per block in every kernel
 constexpr double LAUNCH_MS = 25;    // target length of one lookahead launch
+constexpr int DEPTH = 8;            // table loads in flight per thread in lookahead_kernel
 
 // Feedback for every (answer, guess) pair, in both layouts: pool-major for the
 // lookahead kernel (a warp reads 32 neighbouring guesses for one answer) and
@@ -152,12 +153,38 @@ __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restric
 			if (HARD && !rule.allows(words + 5 * g2)) continue;
 #pragma unroll
 			for (int w = 0; w < 8; w++) mybits[w * BD] = 0;
-#pragma unroll 4
-			for (int j = 0; j < s; j++)
+			// The bit stores might alias the member list as far as the compiler knows, so
+			// written as one loop each member's table load waits for the previous member's
+			// bits: one load in flight per thread. Fetch the next DEPTH members' patterns
+			// before setting the bits of these. The tests on j + u < s are block-uniform.
+			const uint8_t * col = pt + g2;
+			uint32_t q[DEPTH], nq[DEPTH];
+#pragma unroll
+			for (int u = 0; u < DEPTH; u++) q[u] = u < s ? col[(uint32_t)mem[u] * G] : 0;
+			int j = 0;
+			for (; j + 2 * DEPTH <= s; j += DEPTH) // the next batch is full
 			{
-				const uint32_t q = pt[(uint32_t)mem[j] * G + g2];
-				mybits[(q >> 5) * BD] |= 1u << (q & 31);
+#pragma unroll
+				for (int u = 0; u < DEPTH; u++) nq[u] = col[(uint32_t)mem[j + DEPTH + u] * G];
+#pragma unroll
+				for (int u = 0; u < DEPTH; u++) mybits[(q[u] >> 5) * BD] |= 1u << (q[u] & 31);
+#pragma unroll
+				for (int u = 0; u < DEPTH; u++) q[u] = nq[u];
 			}
+			if (j + DEPTH < s) // a partial batch follows
+			{
+#pragma unroll
+				for (int u = 0; u < DEPTH; u++)
+					nq[u] = j + DEPTH + u < s ? col[(uint32_t)mem[j + DEPTH + u] * G] : 0;
+#pragma unroll
+				for (int u = 0; u < DEPTH; u++) mybits[(q[u] >> 5) * BD] |= 1u << (q[u] & 31);
+#pragma unroll
+				for (int u = 0; u < DEPTH; u++) q[u] = nq[u];
+				j += DEPTH;
+			}
+#pragma unroll
+			for (int u = 0; u < DEPTH; u++)
+				if (j + u < s) mybits[(q[u] >> 5) * BD] |= 1u << (q[u] & 31);
 			int d = 0;
 #pragma unroll
 			for (int w = 0; w < 8; w++) d += __popc(mybits[w * BD]);
