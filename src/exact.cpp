@@ -143,13 +143,12 @@ struct ExactSolver::Tables
 {
 	int G = 0, W = 0;   // guesses, 64-guess blocks
 	size_t stride = 0;  // W * 64
-	uint8_t * pm = nullptr;
+	const uint8_t * pm = nullptr; // Engine::pool_major()
 	std::vector<uint64_t> full;    // the real guesses of each block
 	std::vector<uint64_t> green;   // [(pos * 26 + letter) * W + block]
 	std::vector<uint64_t> atleast; // [(letter * 5 + copies - 1) * W + block]
 	bool letters_ok = true;        // every word is a-z
 
-	~Tables() { std::free(pm); }
 	const uint8_t * prow(int p) const { return pm + (size_t)p * stride; }
 
 	void allowed(const HardRule & r, const std::vector<std::string> & words, uint64_t * out) const
@@ -206,16 +205,10 @@ ExactSolver::ExactSolver(const Engine & eng, bool hard, int threads)
 	t.G = G;
 	t.W = (G + 63) / 64;
 	t.stride = (size_t)t.W * 64;
-	t.pm = (uint8_t *)std::aligned_alloc(64, (size_t)P * t.stride);
-	if (!t.pm) throw std::bad_alloc();
-	// Transpose in 64x64 tiles; padding guesses read as 0 and are never allowed.
-	for (int g0 = 0; g0 < (int)t.stride; g0 += 64)
-		for (int p0 = 0; p0 < P; p0 += 64)
-			for (int g = g0; g < g0 + 64; g++)
-			{
-				const uint8_t * row = g < G ? eng.row(g) : nullptr;
-				for (int p = p0; p < std::min(P, p0 + 64); p++) t.pm[(size_t)p * t.stride + g] = row ? row[p] : 0;
-			}
+	// Padding guesses read as 0 and are never allowed.
+	size_t stride;
+	t.pm = eng.pool_major(stride);
+	if (stride != t.stride) throw std::logic_error("pool-major table stride mismatch");
 
 	t.full.assign(t.W, ~0ull);
 	if (G % 64) t.full[t.W - 1] = (1ull << (G % 64)) - 1;

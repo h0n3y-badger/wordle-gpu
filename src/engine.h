@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,9 @@ public:
 	// Feedback for guess g against pool entry p, from the host copy of the table.
 	uint8_t pat(int g, int p) const { return table_[(size_t)g * pool_.size() + p]; }
 	const uint8_t * row(int g) const { return table_.data() + (size_t)g * pool_.size(); }
+	// The same table pool-major: row p at p * stride, guesses padded with zeros to a
+	// multiple of 64 and 64-byte aligned. Copied from the GPU on first use.
+	const uint8_t * pool_major(size_t & stride) const;
 
 	// cands are pool indices; guesses are word indices. One result per guess.
 	void stats(const std::vector<uint16_t> & cands, const std::vector<int> & guesses,
@@ -66,5 +70,8 @@ private:
 	std::vector<std::string> words_;
 	std::vector<int> pool_;
 	std::vector<uint8_t> table_; // guess-major
+	mutable std::once_flag pm_once_;
+	mutable std::unique_ptr<uint8_t, void (*)(void *)> pm_{ nullptr, std::free };
+	mutable size_t pm_stride_ = 0;
 	std::string device_name_;
 };

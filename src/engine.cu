@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 
@@ -270,6 +271,22 @@ Engine::~Engine()
 {
 	cudaEventDestroy(dev_->start);
 	cudaEventDestroy(dev_->stop);
+}
+
+const uint8_t * Engine::pool_major(size_t & stride) const
+{
+	std::call_once(pm_once_, [this] {
+		const size_t G = num_guesses(), P = pool_size(), st = (G + 63) / 64 * 64;
+		uint8_t * p = (uint8_t *)std::aligned_alloc(64, P * st);
+		if (!p) throw std::bad_alloc();
+		pm_.reset(p);
+		for (size_t i = 0; i < P; i++) std::fill(p + i * st + G, p + (i + 1) * st, 0);
+		std::lock_guard<std::mutex> lock(dev_->mu);
+		CUDA_CHECK(cudaMemcpy2D(p, st, dev_->pt.p, G, G, P, cudaMemcpyDeviceToHost));
+		pm_stride_ = st;
+	});
+	stride = pm_stride_;
+	return pm_.get();
 }
 
 void Engine::stats(const std::vector<uint16_t> & cands, const std::vector<int> & guesses,
