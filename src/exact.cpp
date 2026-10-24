@@ -1,6 +1,7 @@
 #include "exact.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -10,7 +11,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#ifdef __AVX512BW__
+#include <utility>
+#if defined(__AVX512BW__) || defined(__BMI2__)
 #include <immintrin.h>
 #endif
 
@@ -105,22 +107,60 @@ struct Hist
 
 thread_local Hist tl_hist;
 
-// Sets up to this size count distinct feedbacks 64 guesses at a time by comparing
-// every pair of candidates (counts are bytes, so at most 255).
-constexpr int VEC_MAX = 192;
+// Sets up to this size count distinct feedbacks 64 guesses at a time in vector registers
+// (counts are bytes), padded up to NET_ROWS rows.
+constexpr int VEC_MAX = 248;
+constexpr int NET_ROWS = 256;
 
-struct RawOpt { int lb, g; };
+// A node's guess scan, kept while its options are tried. Per chunk of 64 lanes (a block of
+// guesses, or in hard mode a run of blocks with only the allowed guesses, packed): each
+// lane's distinct feedbacks, the lanes whose bound is below beta, and which are candidates.
+struct alignas(64) Lanes { uint8_t v[64]; };
+struct Frame
+{
+	std::vector<Lanes> cnt;
+	std::vector<uint64_t> sel, cand;
+	std::vector<uint16_t> ids; // the guess in each lane, when packed
+	int nch = 0;
+	bool packed = false;
+	int top[2]; // largest count among the selected non-candidates / candidates, -1 if none
+	int most[2]; // largest count among all allowed non-candidates / candidates (left >= 3)
+
+	int guess(int k, int l) const { return packed ? ids[k * 64 + l] : k * 64 + l; }
+};
+
+// Frames by recursion depth on this thread: a node's frame outlives the scans of its children.
+thread_local std::vector<std::unique_ptr<Frame>> tl_frames;
+thread_local int tl_depth = 0;
+
+struct FrameRef
+{
+	Frame & f;
+	explicit FrameRef(int W) : f(get(W)) {}
+	~FrameRef() { tl_depth--; }
+	FrameRef(const FrameRef &) = delete;
+	static Frame & get(int W)
+	{
+		if ((int)tl_frames.size() <= tl_depth) tl_frames.emplace_back(new Frame);
+		Frame & f = *tl_frames[tl_depth++];
+		if ((int)f.sel.size() < W)
+		{
+			f.cnt.resize(W);
+			f.sel.resize(W);
+			f.cand.resize(W);
+		}
+		return f;
+	}
+};
 
 // Per-thread scratch for the guess scan; nothing in it lives across a recursive call.
 struct Scratch
 {
 #ifdef __AVX512BW__
-	__m512i buf[VEC_MAX];
+	__m512i stage[VEC_MAX]; // packed rows of one chunk
 #endif
-	const uint8_t * rows[VEC_MAX];
+	const uint8_t * rows[NET_ROWS];
 	std::vector<uint64_t> allow, cand; // one bit per guess
-	std::vector<RawOpt> raw;
-	std::vector<int> bucket;
 };
 
 thread_local Scratch tl_scratch;
@@ -179,51 +219,359 @@ inline bool perfect_split(const Engine & eng, const uint16_t * s, int n)
 }
 
 #ifdef __AVX512BW__
-// Distinct feedbacks over the n candidate rows for 64 neighbouring guesses, one byte per guess:
-// a row adds one wherever it differs from every earlier row. Four rows go at a time so the
-// four masked-compare chains overlap.
-inline __m512i distinct64(const uint8_t * const * rows, size_t off, int n, __m512i * buf)
+// Distinct feedbacks over n candidate rows for 64 neighbouring guesses, one byte per guess.
+// Rows past n point at row 0, which never adds a feedback, so a counter may round n up.
+
+// Sorting networks: Batcher's odd-even merge sort for the next power of two, comparators that
+// touch a position >= N dropped (those would only ever hold +infinity). Up to 32 rows the
+// comparators go layer by layer; above that depth-first (sort each half, then merge), which
+// keeps fewer rows live at once and so spills far less.
+template <class F>
+constexpr void oem_merge(int lo, int n, int r, int N, F & f)
 {
+	const int m = 2 * r;
+	if (m < n)
+	{
+		oem_merge(lo, n, m, N, f);
+		oem_merge(lo + r, n, m, N, f);
+		for (int i = lo + r; i + r < lo + n; i += m)
+			if (i + r < N) f(i, i + r);
+	}
+	else if (lo + r < N) f(lo, lo + r);
+}
+template <class F>
+constexpr void oem_sort(int lo, int n, int N, F & f)
+{
+	if (n < 2) return;
+	oem_sort(lo, n / 2, N, f);
+	oem_sort(lo + n / 2, n / 2, N, f);
+	oem_merge(lo, n, 1, N, f);
+}
+template <class F>
+constexpr void network(int N, F & f)
+{
+	int P = 1;
+	while (P < N) P *= 2;
+	if (N > 32)
+	{
+		oem_sort(0, P, N, f);
+		return;
+	}
+	for (int p = 1; p < P; p += p)
+		for (int k = p; k > 0; k /= 2)
+			for (int j = k % p; j + k < P; j += 2 * k)
+				for (int i = 0; i < k && i + j + k < N; i++)
+					if ((i + j) / (2 * p) == (i + j + k) / (2 * p)) f(i + j, i + j + k);
+}
+template <int N>
+struct Network
+{
+	struct Count { int m = 0; constexpr void operator()(int, int) { m++; } };
+	static constexpr int M = [] { Count c; network(N, c); return c.m; }();
+	struct Fill { std::array<std::pair<int, int>, M> p{}; int m = 0; constexpr void operator()(int a, int b) { p[m++] = { a, b }; } };
+	static constexpr auto pairs = [] { Fill f; network(N, f); return f.p; }();
+};
+
+// Sorts the N feedbacks of each guess with a min/max network unrolled at compile time (the
+// rows stay in registers, mostly) and counts the changes between neighbours.
+template <int N>
+__m512i distinct_sorted(const uint8_t * const * rows, size_t off, int)
+{
+	__m512i v[N];
+#pragma GCC unroll 4096
+	for (int j = 0; j < N; j++) v[j] = _mm512_load_si512(rows[j] + off);
+#pragma GCC unroll 4096
+	for (int i = 0; i < Network<N>::M; i++)
+	{
+		const int a = Network<N>::pairs[i].first, b = Network<N>::pairs[i].second;
+		const __m512i x = v[a], y = v[b];
+		v[a] = _mm512_min_epu8(x, y);
+		v[b] = _mm512_max_epu8(x, y);
+	}
 	const __m512i one = _mm512_set1_epi8(1);
 	__m512i cnt = one;
-	buf[0] = _mm512_load_si512(rows[0] + off);
-	int j = 1;
-	for (; j + 3 < n; j += 4)
+#pragma GCC unroll 4096
+	for (int j = 1; j < N; j++) cnt = _mm512_mask_add_epi8(cnt, _mm512_cmpneq_epu8_mask(v[j], v[j - 1]), cnt, one);
+	return cnt;
+}
+
+// Network sizes past 32; n rounds up to the next.
+#ifndef NET_PAD_LIST
+#define NET_PAD_LIST 36, 40, 44, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
+#endif
+constexpr int NET_PAD[] = { NET_PAD_LIST };
+constexpr int NET_MAX = NET_PAD[sizeof NET_PAD / sizeof NET_PAD[0] - 1];
+constexpr int net_size(int n)
+{
+	if (n <= 32) return n < 2 ? 2 : n;
+	if (n > NET_MAX) return (n + 3) & ~3;
+	int i = 0;
+	while (NET_PAD[i] < n) i++;
+	return NET_PAD[i];
+}
+static_assert(net_size(VEC_MAX) <= NET_ROWS);
+
+// Past the networks: a row adds one wherever it differs from every earlier row. Differences
+// are tracked as min(row ^ earlier) per byte (zero where equal), four rows at a time.
+inline __m512i distinct_pairs(const uint8_t * const * rows, size_t off, int n)
+{
+	static thread_local __m512i buf[NET_ROWS];
+	const __m512i one = _mm512_set1_epi8(1);
+	__m512i cnt = _mm512_setzero_si512();
+	for (int j = 0; j < n; j += 4)
 	{
 		const __m512i a = _mm512_load_si512(rows[j] + off), b = _mm512_load_si512(rows[j + 1] + off);
 		const __m512i c = _mm512_load_si512(rows[j + 2] + off), d = _mm512_load_si512(rows[j + 3] + off);
-		__mmask64 ka = ~0ull;
-		__mmask64 kb = _mm512_cmpneq_epu8_mask(b, a);
-		__mmask64 kc = _mm512_mask_cmpneq_epu8_mask(_mm512_cmpneq_epu8_mask(c, a), c, b);
-		__mmask64 kd = _mm512_mask_cmpneq_epu8_mask(_mm512_mask_cmpneq_epu8_mask(_mm512_cmpneq_epu8_mask(d, a), d, b), d, c);
+		__m512i da = _mm512_set1_epi8(-1), db = _mm512_xor_si512(b, a);
+		__m512i dc = _mm512_min_epu8(_mm512_xor_si512(c, a), _mm512_xor_si512(c, b));
+		__m512i dd = _mm512_min_epu8(_mm512_min_epu8(_mm512_xor_si512(d, a), _mm512_xor_si512(d, b)), _mm512_xor_si512(d, c));
 		for (int i = 0; i < j; i++)
 		{
 			const __m512i x = buf[i];
-			ka = _mm512_mask_cmpneq_epu8_mask(ka, a, x);
-			kb = _mm512_mask_cmpneq_epu8_mask(kb, b, x);
-			kc = _mm512_mask_cmpneq_epu8_mask(kc, c, x);
-			kd = _mm512_mask_cmpneq_epu8_mask(kd, d, x);
+			da = _mm512_min_epu8(da, _mm512_xor_si512(a, x));
+			db = _mm512_min_epu8(db, _mm512_xor_si512(b, x));
+			dc = _mm512_min_epu8(dc, _mm512_xor_si512(c, x));
+			dd = _mm512_min_epu8(dd, _mm512_xor_si512(d, x));
 		}
 		buf[j] = a;
 		buf[j + 1] = b;
 		buf[j + 2] = c;
 		buf[j + 3] = d;
-		cnt = _mm512_mask_add_epi8(cnt, ka, cnt, one);
-		cnt = _mm512_mask_add_epi8(cnt, kb, cnt, one);
-		cnt = _mm512_mask_add_epi8(cnt, kc, cnt, one);
-		cnt = _mm512_mask_add_epi8(cnt, kd, cnt, one);
-	}
-	for (; j < n; j++)
-	{
-		const __m512i a = _mm512_load_si512(rows[j] + off);
-		__mmask64 ka = ~0ull;
-		for (int i = 0; i < j; i++) ka = _mm512_mask_cmpneq_epu8_mask(ka, a, buf[i]);
-		buf[j] = a;
-		cnt = _mm512_mask_add_epi8(cnt, ka, cnt, one);
+		cnt = _mm512_add_epi8(cnt, _mm512_min_epu8(da, one));
+		cnt = _mm512_add_epi8(cnt, _mm512_min_epu8(db, one));
+		cnt = _mm512_add_epi8(cnt, _mm512_min_epu8(dc, one));
+		cnt = _mm512_add_epi8(cnt, _mm512_min_epu8(dd, one));
 	}
 	return cnt;
 }
+
+using DistinctFn = __m512i (*)(const uint8_t * const * rows, size_t off, int n);
+struct NetTable { DistinctFn fn[VEC_MAX + 1]; };
+template <size_t... K>
+constexpr NetTable make_nets(std::index_sequence<K...>)
+{
+	return { { (K <= NET_MAX ? &distinct_sorted<net_size(K <= NET_MAX ? (int)K : 2)> : &distinct_pairs)... } };
+}
+constexpr NetTable NETS = make_nets(std::make_index_sequence<VEC_MAX + 1>());
+
+inline int max_byte(__m512i v)
+{
+	const __m256i a = _mm256_max_epu8(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
+	__m128i b = _mm_max_epu8(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+	b = _mm_max_epu8(b, _mm_srli_si128(b, 8));
+	b = _mm_max_epu8(b, _mm_srli_si128(b, 4));
+	b = _mm_max_epu8(b, _mm_srli_si128(b, 2));
+	b = _mm_max_epu8(b, _mm_srli_si128(b, 1));
+	return _mm_cvtsi128_si32(b) & 255;
+}
 #endif
+
+// What the guess scan of a node needs.
+struct ScanIn
+{
+	const Engine & eng;
+	const uint8_t * pm; // pool-major table
+	size_t stride;
+	int W;
+	const uint16_t * s;
+	int n, left, beta, lo;
+	const uint64_t * allow, * cand;
+	bool dense; // every guess allowed
+};
+
+// Scans every allowed guess for its bound n + 2(n-in) - groups = 3n - in - distinct into f.
+// Returns true when some guess settles the node at 2n: a non-candidate splitting all apart,
+// or (with a guess to spare) a candidate leaving one pair. With two guesses left only that
+// is looked for. Otherwise (left >= 3) f selects the guesses with distinct > lo and bound
+// < beta, and has the most distinct feedbacks of any allowed guess.
+bool scan(const ScanIn & in, Frame & f)
+{
+	const int n = in.n, left = in.left, lo = in.lo, W = in.W;
+	// Non-candidates have bound 3n - distinct.
+	const int thr = std::max(lo, 3 * n - in.beta);
+	f.packed = false;
+	f.nch = W;
+#ifdef __AVX512BW__
+	if (n <= VEC_MAX)
+	{
+		Scratch & sc = tl_scratch;
+		const DistinctFn df = NETS.fn[n];
+		const int padn = net_size(n);
+		const __m512i vn = _mm512_set1_epi8((char)n), vn1 = _mm512_set1_epi8((char)(n - 1));
+		const __m512i vlo = _mm512_set1_epi8((char)lo), vthr = _mm512_set1_epi8((char)thr);
+		__m512i top0 = _mm512_setzero_si512(), top1 = _mm512_setzero_si512();
+		__m512i most0 = _mm512_setzero_si512(), most1 = _mm512_setzero_si512();
+		// Chunk k's counts for the lanes in valid; true if settled.
+		auto finish = [&](int k, __m512i cnt, uint64_t valid, uint64_t cd) {
+			const uint64_t done = (_mm512_cmpeq_epi8_mask(cnt, vn) & ~cd) | (left >= 3 ? _mm512_cmpeq_epi8_mask(cnt, vn1) & cd : 0);
+			if (done & valid) return true;
+			uint64_t sel = 0;
+			if (left >= 3)
+			{
+				sel = ((_mm512_cmpgt_epu8_mask(cnt, vthr) & ~cd) | (_mm512_cmpgt_epu8_mask(cnt, vlo) & cd)) & valid;
+				_mm512_store_si512(f.cnt[k].v, cnt);
+				top0 = _mm512_mask_max_epu8(top0, sel & ~cd, top0, cnt);
+				top1 = _mm512_mask_max_epu8(top1, sel & cd, top1, cnt);
+				most0 = _mm512_mask_max_epu8(most0, valid & ~cd, most0, cnt);
+				most1 = _mm512_mask_max_epu8(most1, valid & cd, most1, cnt);
+			}
+			f.sel[k] = sel;
+			f.cand[k] = cd;
+			return false;
+		};
+#if defined(__AVX512VBMI__) && defined(__AVX512VBMI2__) && defined(__BMI2__)
+		// Hard mode often allows a few guesses per block: pack runs of blocks with at most
+		// 64 allowed guesses into one chunk, so each counts once.
+		int A = 0, B = 0;
+		if (!in.dense && n >= 8)
+			for (int b = 0; b < W; b++)
+			{
+				A += std::popcount(in.allow[b]);
+				B += in.allow[b] != 0;
+			}
+		if (B && A <= 40 * B)
+		{
+			f.packed = true;
+			if ((int)f.ids.size() < W * 64) f.ids.resize((size_t)W * 64);
+			const uint8_t * src[VEC_MAX];
+			for (int j = 0; j < n; j++)
+			{
+				src[j] = in.pm + (size_t)in.s[j] * in.stride;
+				sc.rows[j] = (const uint8_t *)&sc.stage[j];
+			}
+			for (int j = n; j < padn; j++) sc.rows[j] = sc.rows[0];
+			const __m512i iota = _mm512_set_epi8(63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42,
+				41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+				10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+			int k = 0;
+			for (int b = 0; b < W; k++)
+			{
+				// Chunk k takes whole blocks while their allowed guesses fit: block blk[t]'s
+				// go to the lanes in put[t], picked out of its row block by idx[t].
+				int blk[64], nb = 0, pos = 0;
+				__m512i idx[64];
+				uint64_t put[64], cd = 0;
+				for (; b < W; b++)
+				{
+					const uint64_t a = in.allow[b];
+					const int p = std::popcount(a);
+					if (pos + p > 64) break;
+					if (!p) continue;
+					uint16_t * id = &f.ids[k * 64 + pos];
+					for (uint64_t m = a; m; m &= m - 1) *id++ = (uint16_t)(b * 64 + std::countr_zero(m));
+					cd |= _pext_u64(in.cand[b], a) << pos;
+					put[nb] = (p == 64 ? ~0ull : (1ull << p) - 1) << pos;
+					idx[nb] = _mm512_maskz_expand_epi8(put[nb], _mm512_maskz_compress_epi8(a, iota));
+					blk[nb++] = b;
+					pos += p;
+				}
+				if (!nb) break;
+				for (int j = 0; j < n; j++)
+				{
+					__m512i row = _mm512_setzero_si512();
+					for (int t = 0; t < nb; t++)
+						row = _mm512_mask_permutexvar_epi8(row, put[t], idx[t], _mm512_load_si512(src[j] + 64 * (size_t)blk[t]));
+					sc.stage[j] = row;
+				}
+				if (finish(k, df(sc.rows, 0, n), pos == 64 ? ~0ull : (1ull << pos) - 1, cd)) return true;
+			}
+			f.nch = k;
+		}
+		else
+#endif
+		{
+			for (int j = 0; j < n; j++) sc.rows[j] = in.pm + (size_t)in.s[j] * in.stride;
+			for (int j = n; j < padn; j++) sc.rows[j] = sc.rows[0];
+			for (int b = 0; b < W; b++)
+			{
+				if (!in.allow[b]) { f.sel[b] = 0; continue; }
+				if (finish(b, df(sc.rows, (size_t)b * 64, n), in.allow[b], in.cand[b])) return true;
+			}
+		}
+		// Selected counts are at least 2, so 0 means none.
+		f.top[0] = max_byte(top0) ? max_byte(top0) : -1;
+		f.top[1] = max_byte(top1) ? max_byte(top1) : -1;
+		f.most[0] = max_byte(most0);
+		f.most[1] = max_byte(most1);
+		return false;
+	}
+#endif
+	f.top[0] = f.top[1] = -1;
+	f.most[0] = f.most[1] = 0;
+	for (int b = 0; b < W; b++)
+	{
+		const uint64_t cd = in.cand[b];
+		uint64_t sel = 0;
+		for (uint64_t m = in.allow[b]; m; m &= m - 1)
+		{
+			const int l = std::countr_zero(m);
+			const uint8_t * row = in.eng.row(b * 64 + l);
+			uint64_t seen[4] = { 0, 0, 0, 0 };
+			for (int j = 0; j < n; j++)
+			{
+				const uint8_t x = row[in.s[j]];
+				seen[x >> 6] |= 1ull << (x & 63);
+			}
+			const int d = std::popcount(seen[0]) + std::popcount(seen[1]) + std::popcount(seen[2]) + std::popcount(seen[3]);
+			const int c = (int)(cd >> l & 1);
+			if (c ? d == n - 1 && left >= 3 : d == n) return true;
+			f.most[c] = std::max(f.most[c], d);
+			if (left >= 3 && d > (c ? lo : thr))
+			{
+				f.cnt[b].v[l] = (uint8_t)d;
+				sel |= 1ull << l;
+				f.top[c] = std::max(f.top[c], d);
+			}
+		}
+		f.sel[b] = sel;
+		f.cand[b] = cd;
+	}
+	return false;
+}
+
+// Calls take(lb, g) for the selected guesses in the order solve tries them: by bound, then
+// non-candidates first (one more group, so smaller ones), then guess order. Stops when take
+// returns false. Each pass collects one count of one class and finds the next.
+template <class Take>
+void for_options(const Frame & f, int n, Take && take)
+{
+	int top[2] = { f.top[0], f.top[1] };
+	while (top[0] >= 0 || top[1] >= 0)
+	{
+		// Bound 3n - in - count.
+		const int in = top[0] < 0 ? 1 : top[1] < 0 ? 0 : 3 * n - top[0] <= 3 * n - 1 - top[1] ? 0 : 1;
+		const int t = top[in], lb = 3 * n - in - t;
+		int next = -1;
+#ifdef __AVX512BW__
+		const __m512i vt = _mm512_set1_epi8((char)t);
+		__m512i nx = _mm512_setzero_si512();
+#endif
+		for (int k = 0; k < f.nch; k++)
+		{
+			const uint64_t m = f.sel[k] & (in ? f.cand[k] : ~f.cand[k]);
+			if (!m) continue;
+#ifdef __AVX512BW__
+			const __m512i v = _mm512_load_si512(f.cnt[k].v);
+			uint64_t eq = _mm512_cmpeq_epi8_mask(v, vt) & m;
+			nx = _mm512_mask_max_epu8(nx, _mm512_cmplt_epu8_mask(v, vt) & m, nx, v);
+#else
+			uint64_t eq = 0;
+			for (uint64_t r = m; r; r &= r - 1)
+			{
+				const int l = std::countr_zero(r), c = f.cnt[k].v[l];
+				if (c == t) eq |= 1ull << l;
+				else if (c < t) next = std::max(next, c);
+			}
+#endif
+			for (; eq; eq &= eq - 1)
+				if (!take(lb, f.guess(k, std::countr_zero(eq)))) return;
+		}
+#ifdef __AVX512BW__
+		if (const int x = max_byte(nx)) next = x;
+#endif
+		top[in] = next;
+	}
+}
 
 }
 
@@ -350,10 +698,7 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	// n-2 groups, any other guess into at most n.
 	if (beta <= 2 * n) return 2 * n;
 
-	// Scan every allowed guess for its bound n + 2(n-in) - groups = 3n - in - distinct.
-	// A bound of 2n is met exactly by a non-candidate splitting all apart, or (with a
-	// guess to spare) a candidate leaving one pair: that settles the node at once.
-	// With two guesses left nothing else can finish, so only those are looked for.
+	// Scan every allowed guess; see scan().
 	const Tables & t = *tab_;
 	Scratch & sc = tl_scratch;
 	const int W = t.W;
@@ -366,66 +711,12 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 	}
 	sc.cand.assign(W, 0);
 	for (int j = 0; j < n; j++) sc.cand[pool[s[j]] >> 6] |= 1ull << (pool[s[j]] & 63);
-	sc.raw.clear();
 	// Guesses with more distinct feedbacks than this may have bound < beta (candidates
 	// one less), and each must have at least two.
 	const int lo = left == 2 ? n - 1 : std::max(1, 3 * n - 1 - beta);
-	bool settled = false;
-	int km = 0, kn = 0; // most distinct feedbacks of a candidate guess / of any other
-	auto take = [&](int g, int distinct) {
-		const int in = (int)(sc.cand[g >> 6] >> (g & 63) & 1);
-		const int lb = 3 * n - in - distinct;
-		if (lb == 2 * n && (!in || left >= 3)) settled = true;
-		else if (left >= 3 && lb < beta) sc.raw.push_back({ lb, g });
-	};
-#ifdef __AVX512BW__
-	if (n <= VEC_MAX)
-	{
-		for (int j = 0; j < n; j++) sc.rows[j] = t.prow(s[j]);
-		const __m512i vlo = _mm512_set1_epi8((char)lo);
-		__m512i vkm = _mm512_setzero_si512(), vkn = _mm512_setzero_si512();
-		alignas(64) uint8_t c8[64];
-		for (int b = 0; b < W && !settled; b++)
-		{
-			if (!allow[b]) continue;
-			const __m512i cnt = distinct64(sc.rows, (size_t)b * 64, n, sc.buf);
-			vkm = _mm512_mask_max_epu8(vkm, allow[b] & sc.cand[b], vkm, cnt);
-			vkn = _mm512_mask_max_epu8(vkn, allow[b] & ~sc.cand[b], vkn, cnt);
-			uint64_t sel = _mm512_cmpgt_epu8_mask(cnt, vlo) & allow[b];
-			if (!sel) continue;
-			_mm512_store_si512(c8, cnt);
-			for (; sel && !settled; sel &= sel - 1)
-			{
-				const int l = std::countr_zero(sel);
-				take(b * 64 + l, c8[l]);
-			}
-		}
-		_mm512_store_si512(c8, vkm);
-		for (int l = 0; l < 64; l++) km = std::max(km, (int)c8[l]);
-		_mm512_store_si512(c8, vkn);
-		for (int l = 0; l < 64; l++) kn = std::max(kn, (int)c8[l]);
-	}
-	else
-#endif
-	{
-		for (int b = 0; b < W && !settled; b++)
-			for (uint64_t m = allow[b]; m && !settled; m &= m - 1)
-			{
-				const int g = b * 64 + std::countr_zero(m);
-				const uint8_t * row = eng_.row(g);
-				uint64_t seen[4] = { 0, 0, 0, 0 };
-				for (int j = 0; j < n; j++)
-				{
-					const uint8_t f = row[s[j]];
-					seen[f >> 6] |= 1ull << (f & 63);
-				}
-				const int distinct = std::popcount(seen[0]) + std::popcount(seen[1]) + std::popcount(seen[2]) + std::popcount(seen[3]);
-				int & k = sc.cand[g >> 6] >> (g & 63) & 1 ? km : kn;
-				k = std::max(k, distinct);
-				if (distinct > lo) take(g, distinct);
-			}
-	}
-	if (settled)
+	FrameRef fr(W);
+	Frame & f = fr.f;
+	if (scan({ eng_, t.pm, t.stride, W, s, n, left, beta, lo, allow, sc.cand.data(), allow == t.full.data() }, f))
 	{
 		memo_->put(key, { 2 * n, true });
 		return 2 * n;
@@ -435,6 +726,7 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 		memo_->put(key, { INF, true });
 		return INF;
 	}
+	int km = f.most[1], kn = f.most[0]; // most distinct feedbacks of a candidate guess / of any other
 	// The caps bound may refute the node, or show it can't be done in time.
 	int caps = -1;
 	if (n <= CapBound::T && left <= CapBound::H)
@@ -455,28 +747,20 @@ int ExactSolver::solve(const uint16_t * s, int n, int left, const HardRule & rul
 		caps = km << 8 | kn;
 	}
 
-	// Counting sort by bound, then non-candidates before candidates (one more group, so
-	// smaller ones), then guess order. Bounds lie in [2n-1, 3n-2].
-	const int lb0 = 2 * n - 1;
-	auto slot = [&](const RawOpt & o) { return 2 * (o.lb - lb0) + (int)(sc.cand[o.g >> 6] >> (o.g & 63) & 1); };
-	sc.bucket.assign(2 * n + 2, 0);
-	for (const RawOpt & o : sc.raw) sc.bucket[slot(o)]++;
-	for (int i = 0, sum = 0; i < 2 * n + 2; i++) { const int c = sc.bucket[i]; sc.bucket[i] = sum; sum += c; }
-	std::vector<Opt> opts(sc.raw.size());
-	for (const RawOpt & o : sc.raw) opts[sc.bucket[slot(o)]++] = { o.lb, o.g };
-
 	int best = beta;
 	if (n < SHARE_MIN || threads_ == 1)
 	{
-		for (const Opt & o : opts)
-		{
-			if (o.lb >= best) break;
-			best = std::min(best, try_option(s, n, left, rule, o, best, caps));
-		}
+		for_options(f, n, [&](int lb, int g) {
+			if (lb >= best) return false;
+			best = std::min(best, try_option(s, n, left, rule, { lb, g }, best, caps));
+			return true;
+		});
 	}
 	else
 	{
 		// Big node: let idle threads take options too, all pruning against one best.
+		std::vector<Opt> opts;
+		for_options(f, n, [&](int lb, int g) { opts.push_back({ lb, g }); return true; });
 		Shared sh{ s, n, left, &rule, &opts };
 		sh.caps = caps;
 		sh.best = beta;
