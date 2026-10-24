@@ -136,8 +136,10 @@ __global__ void __launch_bounds__(BD) lookahead_kernel(const uint8_t * __restric
 		const int s = counts[p];
 		// Groups of 1 or 2 are split perfectly by guessing one of their words.
 		if (s < 3) continue;
-		// Another slice may already have split this group perfectly.
-		if (*(volatile int *)&best_k[p] == s + 1) continue;
+		// Another slice may already have split this group perfectly. Thread 0 decides for
+		// the whole block so every thread reaches the same barriers.
+		if (tid == 0) perfect = *(volatile int *)&best_k[p] == s + 1;
+		__syncthreads();
 
 		HardRule rule = base;
 		if (HARD) rule.add(words + 5 * g1, p);
