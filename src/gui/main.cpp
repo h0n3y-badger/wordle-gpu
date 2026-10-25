@@ -17,7 +17,7 @@
 // "ret", "bs", "wait" (until the analysis is done), "sleep:MS", "exact", "stop", "undo",
 // "hard", "pool", "row:N",
 // "tab:N", "replay:GAME_ID", "next", "prev", "games" (the saved-games dialog), "dlg:random",
-// "dlg:open", "dlg:shot:FILE", "shot:FILE" or "quit".
+// "dlg:tab:N", "dlg:source:N", "dlg:row:N", "dlg:open", "dlg:shot:FILE", "shot:FILE" or "quit".
 static void run_test(MainWindow * w, QStringList list)
 {
 	auto steps = std::make_shared<QStringList>(list);
@@ -59,6 +59,9 @@ static void run_test(MainWindow * w, QStringList list)
 			auto * d = qobject_cast<QDialog *>(QApplication::activeModalWidget());
 			if (!d) { steps->prepend(s); delay = 50; } // not open yet
 			else if (s == "dlg:random") d->findChild<QPushButton *>("random")->click();
+			else if (s.startsWith("dlg:tab:")) d->findChild<QTabWidget *>("tabs")->setCurrentIndex(s.mid(8).toInt());
+			else if (s.startsWith("dlg:source:")) d->findChild<QComboBox *>("source")->setCurrentIndex(s.mid(11).toInt());
+			else if (s.startsWith("dlg:row:")) d->findChild<QTableView *>("games")->selectRow(s.mid(8).toInt());
 			else if (s == "dlg:open") d->accept();
 			else if (s.startsWith("dlg:shot:")) d->grab().save(s.mid(9));
 		}

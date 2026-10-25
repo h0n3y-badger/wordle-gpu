@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct sqlite3;
@@ -36,6 +37,18 @@ struct StoredGame
 	std::string date() const; // the NYT puzzle's date, or empty
 };
 
+// How one puzzle went in one source: a daily row (WordleBot, MCM), or the source's games.
+struct DayStats
+{
+	std::string source, mode; // mode: normal, hard, ... for daily rows; "shared" for games
+	long games = 0;
+	long hard_games = -1;     // -1 unknown
+	double n[7] = {};         // solved in 1..6, then failed: counts, or percentages
+	bool percent = false;
+	double average = -1;      // the source's average guesses, -1 unknown
+	bool average_solved = false; // the average leaves failed games out
+};
+
 struct GameFilter
 {
 	std::string source;     // source name, empty = any
@@ -61,6 +74,12 @@ public:
 	std::vector<GameSource> sources();
 	std::vector<StoredGame> games(const GameFilter & f);
 	std::optional<StoredGame> game(long id);
+
+	// Every source's numbers for NYT puzzle `puzzle`, daily rows first.
+	std::vector<DayStats> day_stats(int puzzle);
+	std::string answer(int puzzle); // empty if no source knows it
+	// Lowest and highest puzzle with daily rows, or -1 if none.
+	std::pair<int, int> daily_puzzles();
 
 	// Runs SQL with ? parameters bound to args, returning every row as text ("" for NULL).
 	using Rows = std::vector<std::vector<std::string>>;

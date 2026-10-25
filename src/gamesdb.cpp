@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -193,4 +194,56 @@ std::vector<StoredGame> GamesDb::games(const GameFilter & f)
 		if (!dup) out.push_back(std::move(g));
 	}
 	return out;
+}
+
+std::vector<DayStats> GamesDb::day_stats(int puzzle)
+{
+	const std::string p = std::to_string(puzzle);
+	std::vector<DayStats> out;
+	auto num = [](const std::string & s) { return s.empty() ? -1.0 : atof(s.c_str()); };
+	for (const auto & r : query("SELECT s.name, d.mode, d.games, d.hard_games, d.n1, d.n2, d.n3, d.n4, d.n5, d.n6, "
+			"d.failed, d.percent, d.average FROM daily d JOIN sources s ON s.id=d.source WHERE d.puzzle=? "
+			"ORDER BY s.id, d.mode LIKE '%-ps', d.mode DESC", { p }))
+	{
+		DayStats d;
+		d.source = r[0];
+		d.mode = r[1];
+		d.games = atol(r[2].c_str());
+		d.hard_games = r[3].empty() ? -1 : atol(r[3].c_str());
+		for (int i = 0; i < 7; i++) d.n[i] = std::max(0.0, num(r[4 + i]));
+		d.percent = r[11] == "1";
+		d.average = num(r[12]);
+		out.push_back(d);
+	}
+	for (const auto & r : query("SELECT s.name, count(*), sum(g.hard=1), sum(g.hard IS NULL), "
+			"sum(g.result=1), sum(g.result=2), sum(g.result=3), sum(g.result=4), sum(g.result=5), sum(g.result=6), "
+			"sum(g.result=0), avg(CASE WHEN g.result>0 THEN g.result END) "
+			"FROM games g JOIN sources s ON s.id=g.source WHERE g.puzzle=? GROUP BY s.id ORDER BY s.id", { p }))
+	{
+		DayStats d;
+		d.source = r[0];
+		d.mode = "shared";
+		d.games = atol(r[1].c_str());
+		d.hard_games = atol(r[3].c_str()) == d.games ? -1 : atol(r[2].c_str());
+		for (int i = 0; i < 7; i++) d.n[i] = atof(r[4 + i].c_str());
+		d.average = num(r[11]);
+		d.average_solved = true;
+		out.push_back(d);
+	}
+	return out;
+}
+
+std::string GamesDb::answer(int puzzle)
+{
+	const std::string p = std::to_string(puzzle);
+	const Rows r = query("SELECT answer FROM daily WHERE puzzle=? AND answer IS NOT NULL "
+		"UNION ALL SELECT answer FROM games WHERE puzzle=? AND answer IS NOT NULL LIMIT 1", { p, p });
+	return r.empty() ? std::string() : r[0][0];
+}
+
+std::pair<int, int> GamesDb::daily_puzzles()
+{
+	const Rows r = query("SELECT min(puzzle), max(puzzle) FROM daily");
+	if (r.empty() || r[0][0].empty()) return { -1, -1 };
+	return { std::stoi(r[0][0]), std::stoi(r[0][1]) };
 }

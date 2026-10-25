@@ -326,36 +326,23 @@ static int cmd_day(GamesDb & db, const std::string & arg)
 	}
 	StoredGame probe;
 	probe.puzzle = atoi(puzzle.c_str());
-	printf("Wordle %s, %s", puzzle.c_str(), probe.date().c_str());
-	const auto ans = db.query("SELECT answer FROM daily WHERE puzzle=? AND answer IS NOT NULL "
-		"UNION SELECT answer FROM games WHERE puzzle=? AND answer IS NOT NULL LIMIT 1", { puzzle, puzzle });
-	printf(": %s\n\n", ans.empty() ? "answer unknown" : ans[0][0].c_str());
+	const std::string answer = db.answer(probe.puzzle);
+	printf("Wordle %d, %s: %s\n\n", probe.puzzle, probe.date().c_str(), answer.empty() ? "answer unknown" : answer.c_str());
 
-	const auto daily = db.query("SELECT s.name, d.mode, d.games, d.hard_games, d.n1, d.n2, d.n3, d.n4, d.n5, d.n6, "
-		"d.failed, d.percent, d.average FROM daily d JOIN sources s ON s.id=d.source WHERE d.puzzle=? "
-		"ORDER BY s.id, d.mode LIKE '%-ps', d.mode DESC", { puzzle });
-	for (const auto & r : daily)
+	const auto stats = db.day_stats(probe.puzzle);
+	for (const DayStats & d : stats)
 	{
-		printf("%-14s %-6s %8s results", r[0].c_str(), r[1].c_str(), r[2].c_str());
-		if (!r[3].empty()) printf(" (%s hard)", r[3].c_str());
+		printf("%-14s %-6s %8ld results", d.source.c_str(), d.mode.c_str(), d.games);
+		if (d.hard_games >= 0) printf(" (%ld hard)", d.hard_games);
+		if (d.average >= 0) printf("  average %.3f%s", d.average, d.average_solved ? " when solved" : "");
 		double sum = 0;
-		for (int i = 4; i <= 10; i++) sum += num(r[i]);
-		printf("  average %.3f\n%22s", num(r[12]), "");
-		for (int i = 4; i <= 10; i++)
-			printf("%s: %.1f%%  ", i == 10 ? "X" : std::to_string(i - 3).c_str(), sum > 0 ? 100 * num(r[i]) / sum : 0.0);
+		for (double x : d.n) sum += x;
+		printf("\n%22s", "");
+		for (int i = 0; i < 7; i++)
+			printf("%s: %.1f%%  ", i == 6 ? "X" : std::to_string(i + 1).c_str(), sum > 0 ? 100 * d.n[i] / sum : 0.0);
 		printf("\n");
 	}
-	const auto games = db.query("SELECT s.name, count(*), avg(CASE WHEN g.result>0 THEN g.result END), "
-		"sum(g.result=0), sum(g.result=1), sum(g.result=2), sum(g.result=3), sum(g.result=4), sum(g.result=5), "
-		"sum(g.result=6) FROM games g JOIN sources s ON s.id=g.source WHERE g.puzzle=? GROUP BY s.id", { puzzle });
-	for (const auto & r : games)
-	{
-		const double n = num(r[1]);
-		printf("%-14s shared %8s results  average %.3f when solved\n%22s", r[0].c_str(), r[1].c_str(), num(r[2]), "");
-		for (int i = 4; i <= 9; i++) printf("%d: %.1f%%  ", i - 3, 100 * num(r[i]) / n);
-		printf("X: %.1f%%\n", 100 * num(r[3]) / n);
-	}
-	if (daily.empty() && games.empty()) printf("No data for this puzzle.\n");
+	if (stats.empty()) printf("No data for this puzzle.\n");
 	return 0;
 }
 

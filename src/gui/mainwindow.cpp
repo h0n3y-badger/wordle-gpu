@@ -251,7 +251,7 @@ void MainWindow::openGame()
 #ifdef WORDLE_GPU_GAMES
 	try
 	{
-		GamesDialog d(this);
+		GamesDialog d(lists_.allowed, this);
 		if (d.exec() != QDialog::Accepted) return;
 		const StoredGame g = d.selected();
 		if (g.id) replayGame(g.id);

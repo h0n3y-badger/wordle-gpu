@@ -80,9 +80,11 @@ would split them.
   word", for when the answer may be outside the original list.
 - **Solve exactly** runs the exact search until the best guess is proven
   optimal; **Stop** cancels it.
-- **Saved games…** replays a game from the games database (see below) a guess at a
-  time: each step shows the position before the guess that was played, and where
-  that guess ranks against the best.
+- **Saved games…** browses the games database (see below). The *Games* tab lists
+  every source's games; one with words opens on the board and replays a guess at a
+  time, showing where each played guess ranks against the best. Tweets only have
+  colours, so for those it shows which words give each row. The *Puzzles* tab shows
+  each day's spread of guess counts from WordleBot, the MCM data and shared results.
 
 GPU work is cut into launches of about 25 ms so the desktop stays smooth.
 
@@ -162,7 +164,9 @@ Tweets keep no names or text: each player gets an anonymous number per source. E
 game records whether its colours could be real for its answer. LMRL-Gym and clembench
 colour repeated letters their own way (LMRL-Gym shows every extra copy yellow), so 34% and
 10% of their games aren't positions the real game reaches; they are kept but marked, and
-skipped when scoring.
+skipped when scoring. WordleBot's counts before late 2022 come as shortened arrays; the
+importer places them where they match that day's average, and leaves the spread empty
+for the few days where nothing fits.
 
     wordle-gpu-games                       # the sources
     wordle-gpu-games stats                 # solved, average and guess spread per source

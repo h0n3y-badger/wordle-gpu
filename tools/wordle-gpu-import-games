@@ -102,7 +102,9 @@ SOURCES = {
 	"nyt-wordlebot": dict(
 		title="NYT WordleBot daily summaries",
 		url="https://static01.nyt.com/newsgraphics/2022/wordlebot/", license="© The New York Times",
-		kind="daily", notes="Guess counts of WordleBot users per day, normal and hard mode. Undocumented."),
+		kind="daily", notes="Guess counts of WordleBot users per day, normal and hard mode (the -ps modes "
+		"are undocumented). Before late 2022 the counts are short arrays; where none fits the day's average "
+		"the spread is left empty."),
 	"mcm-2023": dict(
 		title="MCM 2023 Problem C data (COMAP)",
 		url="https://github.com/arusli1/MCM-Wordle-Prediction", license="COMAP contest data",
@@ -469,6 +471,24 @@ def import_clembench_kto(lists, dl):
 			consistent)
 
 
+def align_steps(steps, average):
+	"""WordleBot's guess counts as 1..6 then failed. Full arrays have 7 entries; older ones
+	are cut short at either end, so place them where they give the summary's own average
+	(it charges a failure 7 to 7.5). None if no placement fits."""
+	if len(steps) == 7:
+		return list(steps)
+	if not steps or len(steps) > 7 or average is None or not sum(steps):
+		return None
+	best = None
+	for off in range(8 - len(steps)):
+		n = [0] * off + list(steps) + [0] * (7 - off - len(steps))
+		for fail in (7, 7.5):
+			avg = (sum((i + 1) * c for i, c in enumerate(n[:6])) + fail * n[6]) / sum(n)
+			if best is None or abs(avg - average) < best[0]:
+				best = (abs(avg - average), n)
+	return best[1] if best[0] < 0.02 else None
+
+
 def daily_wordlebot(lists, dl, db, src, through, refresh):
 	have = set() if refresh else {d for (d,) in db.execute("SELECT DISTINCT date FROM daily WHERE source=?", (src,))}
 	days = [d for d, w in sorted(lists.by_date.items()) if d <= through and d.isoformat() not in have]
@@ -501,12 +521,14 @@ def daily_wordlebot(lists, dl, db, src, through, refresh):
 			for mode, steps in d["steps"].items():
 				if not isinstance(steps, list) or not all(isinstance(x, (int, float)) for x in steps):
 					continue
-				n = (list(steps) + [0] * 7)[:7]
+				avg = d.get("average")
+				avg = avg.get(mode) if isinstance(avg, dict) else None
+				n = align_steps(steps, avg) or [None] * 7
 				extra = {k: v.get(mode) if isinstance(v, dict) else v for k, v in d.items() if k != "steps"}
 				extra["guesses"] = {k: v for k, v in (d.get("guesses") or {}).items() if k.startswith(mode)}
-				avg = d.get("average")
-				rows.append((src, day.isoformat(), (day - FIRST).days, w, mode, sum(steps), None, *n, 0,
-					avg.get(mode) if isinstance(avg, dict) else None, json.dumps(extra)))
+				extra["steps"] = steps
+				rows.append((src, day.isoformat(), (day - FIRST).days, w, mode, sum(steps), None, *n, 0, avg,
+					json.dumps(extra)))
 	if missing:
 		log(f"  no summary for {missing} days")
 	return rows
