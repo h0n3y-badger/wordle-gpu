@@ -35,6 +35,21 @@ Opening results (2026-10-24 lists):
 | original + NYT picks, 2,386 | normal | TARSE | 3.4233 (8168) |
 | original + NYT picks, 2,386 | hard | LEAST (tied with SALET) | 3.5163 (8390) |
 
+## Test hardware
+
+All timings in this README were measured on:
+
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB (Blackwell, sm_120), driver 615.78 |
+| CPU | AMD Ryzen 7 8700F, 8 cores / 16 threads (Zen 4, AVX-512) |
+| RAM | 32 GB |
+| Software | CUDA 13.4, GCC 16, Qt 6.12, Linux (Artix) |
+
+The exact solver uses AVX-512 when built with `-march=native` on a CPU that has it,
+and falls back to plain code otherwise. The GPU code needs an NVIDIA card; set
+`CMAKE_CUDA_ARCHITECTURES` for cards other than sm_120.
+
 ## Build
 
 Needs CUDA (nvcc, sm_120 by default), CMake, Ninja or Make, and Qt 6 Widgets
