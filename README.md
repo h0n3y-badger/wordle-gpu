@@ -103,7 +103,8 @@ until all are done, `-T` runs out or you press Ctrl-C. Then it writes:
   each guess with its colours, shortest games first.
 
 PREFIX defaults to `wordle-solve-<answers>[-hard]` in the current directory (`-O` changes it).
-All 14,855 openers take about two minutes in normal mode.
+Solving all 14,855 openers takes about an hour in normal mode (58 min on a Ryzen 7 8700F);
+the best ones go fast, the weak ones leave big groups that are slow to solve exactly.
 
 ## Word lists
 
