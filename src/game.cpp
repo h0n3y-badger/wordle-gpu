@@ -340,9 +340,10 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 				cut = vals[top - 1];
 			}
 			// Rows come sorted by bound. Until there are `top` exact values, solve a few
-			// exactly; refutations are quick, so then take many at a time.
+			// exactly; refutations are quick, so then take many at a time. So are guesses
+			// once even the best can't win in time (the cut stays INF).
 			std::vector<size_t> todo;
-			const size_t want = cut < INF ? 8 * chunk : top;
+			const size_t want = vals.size() >= top ? 8 * chunk : top;
 			for (size_t i = 0; i < out.rows.size() && todo.size() < want; i++)
 				if (out.rows[i].exact < 0 && out.rows[i].la.total < cut) todo.push_back(i);
 			if (todo.empty()) break;
