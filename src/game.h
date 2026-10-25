@@ -28,6 +28,9 @@ std::vector<std::string> read_list(const std::string & path);
 
 // $XDG_CACHE_HOME/wordle-gpu or ~/.cache/wordle-gpu.
 std::string default_cache_dir();
+// The file in dir keeping exact opening results, one per word lists, answer list and mode.
+// Lines are "word total", total being the exact sum of guesses over all answers. Empty if dir is.
+std::string opener_cache_path(const Engine & eng, bool hard, const std::string & dir);
 
 enum class Pool
 {

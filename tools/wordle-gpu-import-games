@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""Download published Wordle games and daily statistics into wordle-gpu's games
+database ($XDG_DATA_HOME/wordle-gpu/games.sqlite), for wordle-gpu-games and the GUI.
+
+The data is downloaded from each publisher on this machine and stays here: several
+sources are copyrighted or of unknown licence, so don't redistribute the database or
+the downloads. Importing a source again replaces its earlier rows."""
+import argparse
+import collections
+import csv
+import datetime as dt
+import io
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.request
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+
+FIRST = dt.date(2021, 6, 19)  # puzzle 0
+DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+CACHE_HOME = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+DEFAULT_DB = os.path.join(DATA_HOME, "wordle-gpu", "games.sqlite")
+DEFAULT_DOWNLOADS = os.path.join(CACHE_HOME, "wordle-gpu", "downloads")
+UA = {"User-Agent": "Mozilla/5.0 (wordle-gpu-import-games)"}
+SCHEMA_VERSION = 1
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sources(
+	id INTEGER PRIMARY KEY,
+	name TEXT UNIQUE NOT NULL,  -- short key, e.g. tweets-calvet
+	title TEXT, url TEXT, license TEXT,
+	kind TEXT,                  -- human, simulated, llm or daily
+	notes TEXT,
+	imported TEXT               -- UTC time of the last import
+);
+-- One row per game. guesses is NULL when only the colours were shared.
+CREATE TABLE IF NOT EXISTS games(
+	id INTEGER PRIMARY KEY,
+	source INTEGER NOT NULL REFERENCES sources(id),
+	puzzle INTEGER,             -- NYT puzzle number, NULL for games outside the NYT's
+	answer TEXT,                -- NULL if unknown
+	hard INTEGER,               -- 1 hard mode, 0 normal, NULL unknown
+	player TEXT,                -- anonymous per-source number, or the model for LLM games
+	variant TEXT,               -- source-specific setting (LLM experiment, data split)
+	result INTEGER,             -- guesses used if solved, 0 failed, NULL unfinished
+	guesses TEXT,               -- "tarse colin ..." or NULL
+	colors TEXT NOT NULL,       -- "bbygb ggbby ggggg": g green, y yellow, b gray
+	consistent INTEGER          -- every row could be real for the answer (1/0), NULL unchecked
+);
+-- One row per day, source and mode (normal, hard, or all players).
+CREATE TABLE IF NOT EXISTS daily(
+	source INTEGER NOT NULL REFERENCES sources(id),
+	date TEXT NOT NULL, puzzle INTEGER, answer TEXT,
+	mode TEXT NOT NULL,
+	games INTEGER,              -- results counted
+	hard_games INTEGER,         -- of those in hard mode, where only a total is given
+	n1 REAL, n2 REAL, n3 REAL, n4 REAL, n5 REAL, n6 REAL, failed REAL,
+	percent INTEGER,            -- n1..failed are percentages (1) or counts (0)
+	average REAL,               -- the source's average guesses
+	extra TEXT,                 -- the rest of the source's record, JSON
+	PRIMARY KEY(source, date, mode)
+);
+"""
+INDEXES = """
+CREATE INDEX IF NOT EXISTS games_source ON games(source);
+CREATE INDEX IF NOT EXISTS games_answer ON games(answer);
+CREATE INDEX IF NOT EXISTS games_puzzle ON games(puzzle);
+"""
+
+SOURCES = {
+	"tweets-calvet": dict(
+		title="Wordle games dataset (Óscar Calvet Sisó, Kaggle)",
+		url="https://www.kaggle.com/datasets/scarcalvetsis/wordle-games", license="CC BY-SA 4.0",
+		kind="human", notes="Results shared on Twitter, 2022-01-01 to 2022-11-15; colours only."),
+	"tweets-hamner": dict(
+		title="Wordle Tweets (Ben Hamner, Kaggle)",
+		url="https://www.kaggle.com/datasets/benhamner/wordle-tweets", license="unknown",
+		kind="human", notes="Daily sample of shared results from Wordle 210 to Nov 2022; colours only. "
+		"Almost no failed or hard-mode results: the sample left them out. Overlaps tweets-calvet."),
+	"tweets-vora": dict(
+		title="WordleTweets (Sahil Vora, Kaggle)",
+		url="https://www.kaggle.com/datasets/vora1011/wordletweets", license="CC0",
+		kind="human", notes="About 20k shared results a day from Wordle 254 to Aug 2022; colours only. "
+		"Overlaps tweets-calvet."),
+	"sim-hohmann": dict(
+		title="3.33 Million Wordle Random Simulations (Lucas Hohmann, Kaggle)",
+		url="https://www.kaggle.com/datasets/lucashohmann/wordle-random-simulations", license="CC0",
+		kind="simulated", notes="Random guesses from the original answers, with words."),
+	"lmrl-gym": dict(
+		title="LMRL-Gym Wordle dataset (Berkeley RAIL)",
+		url="https://rail.eecs.berkeley.edu/datasets/rl-llm-bench-dataset/wordle/", license="unknown (code MIT)",
+		kind="simulated", notes="Scripted games over a 431-word answer list, with words; train and eval splits."),
+	"clembench-kto": dict(
+		title="clembench KTO_FINAL, Wordle episodes (Hugging Face)",
+		url="https://huggingface.co/datasets/clembench-playpen/KTO_FINAL", license="unknown",
+		kind="llm", notes="LLM players, with clue and critic variants; rejected guesses left out."),
+	"nyt-wordlebot": dict(
+		title="NYT WordleBot daily summaries",
+		url="https://static01.nyt.com/newsgraphics/2022/wordlebot/", license="© The New York Times",
+		kind="daily", notes="Guess counts of WordleBot users per day, normal and hard mode. Undocumented."),
+	"mcm-2023": dict(
+		title="MCM 2023 Problem C data (COMAP)",
+		url="https://github.com/arusli1/MCM-Wordle-Prediction", license="COMAP contest data",
+		kind="daily", notes="Reported Twitter results per day in 2022, percentages; mirror of the contest file."),
+}
+
+SQUARE = {"🟩": "g", "🟧": "g", "🟨": "y", "🟦": "y", "⬛": "b", "⬜": "b"}
+
+
+def log(*a):
+	print(*a, file=sys.stderr, flush=True)
+
+
+def feedback(g, a):
+	"""The game's colours for guess g against answer a: greens first, then earlier
+	letters take the remaining copies."""
+	res = ["b"] * 5
+	left = collections.Counter()
+	for i in range(5):
+		if g[i] == a[i]:
+			res[i] = "g"
+		else:
+			left[a[i]] += 1
+	for i in range(5):
+		if res[i] != "g" and left[g[i]] > 0:
+			res[i] = "y"
+			left[g[i]] -= 1
+	return "".join(res)
+
+
+def valid_word(w):
+	return len(w) == 5 and w.isascii() and w.isalpha() and w.islower()
+
+
+class Lists:
+	"""The word lists wordle-gpu is built with, plus newer NYT answers."""
+
+	def __init__(self):
+		here = os.path.dirname(os.path.realpath(__file__))
+		for d in (os.path.join(here, "..", "data"), os.path.join(here, "..", "share", "wordle-gpu", "lists")):
+			if os.path.exists(os.path.join(d, "allowed.txt")):
+				break
+		else:
+			sys.exit("can't find wordle-gpu's word lists (data/ or share/wordle-gpu/lists/)")
+		self.allowed = set(self._words(os.path.join(d, "allowed.txt")))
+		self.by_date = {}
+		for path in (os.path.join(d, "nyt-answers.txt"), os.path.join(DATA_HOME, "wordle-gpu", "nyt-answers.txt")):
+			if os.path.exists(path):
+				with open(path) as f:
+					for line in f:
+						p = line.split()
+						if len(p) == 2 and not line.startswith("#") and valid_word(p[1]):
+							self.by_date[dt.date.fromisoformat(p[0])] = p[1]
+		self.allowed |= set(self.by_date.values())
+		self._reach = {}
+
+	@staticmethod
+	def _words(path):
+		with open(path) as f:
+			return [w.strip().lower() for w in f if w.strip()]
+
+	def answer(self, puzzle):
+		return self.by_date.get(FIRST + dt.timedelta(puzzle)) if puzzle is not None else None
+
+	def reachable(self, answer):
+		"""Every colour row some allowed guess can get against answer."""
+		r = self._reach.get(answer)
+		if r is None:
+			r = self._reach[answer] = {feedback(w, answer) for w in self.allowed}
+		return r
+
+	def check_colors(self, answer, colors):
+		if not answer:
+			return None
+		r = self.reachable(answer)
+		return int(all(c in r for c in colors))
+
+	def check_words(self, answer, guesses, colors):
+		if not answer:
+			return None
+		return int(all(g in self.allowed and feedback(g, answer) == c for g, c in zip(guesses, colors)))
+
+
+def fetch(url, dest):
+	"""Download url to dest unless it is already there."""
+	if os.path.exists(dest):
+		return dest
+	os.makedirs(os.path.dirname(dest), exist_ok=True)
+	log(f"  downloading {url}")
+	req = urllib.request.Request(url, headers=UA)
+	tmp = dest + ".part"
+	with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+		total = int(r.headers.get("Content-Length") or 0)
+		done, shown = 0, time.time()
+		while chunk := r.read(1 << 20):
+			f.write(chunk)
+			done += len(chunk)
+			if total and time.time() - shown > 2:
+				log(f"    {done >> 20} of {total >> 20} MB")
+				shown = time.time()
+	os.replace(tmp, dest)
+	return dest
+
+
+def get_json(url, tries=4):
+	req = urllib.request.Request(url, headers=UA)
+	for attempt in range(tries):
+		wait = 1 + 2 * attempt
+		try:
+			with urllib.request.urlopen(req, timeout=30) as r:
+				return json.load(r)
+		except urllib.error.HTTPError as e:
+			if e.code in (403, 404):
+				return None
+			if e.code == 429:
+				wait = max(int(e.headers.get("Retry-After") or 0), 15 * (attempt + 1))
+			err = e
+		except Exception as e:
+			err = e
+		time.sleep(wait)
+	raise RuntimeError(f"{url}: {err}")
+
+
+def kaggle(ref, dl):
+	return fetch(f"https://www.kaggle.com/api/v1/datasets/download/{ref}", os.path.join(dl, ref.replace("/", "_") + ".zip"))
+
+
+def zip_csv(path):
+	"""The single CSV in a Kaggle zip, as dict rows."""
+	csv.field_size_limit(1 << 26)
+	z = zipfile.ZipFile(path)
+	name = next(n for n in z.namelist() if n.endswith(".csv"))
+	return csv.DictReader(io.TextIOWrapper(z.open(name), encoding="utf-8", newline=""))
+
+
+class Players:
+	"""Anonymous numbers in place of user names."""
+
+	def __init__(self):
+		self.ids = {}
+
+	def __call__(self, name):
+		if not name:
+			return None
+		return str(self.ids.setdefault(name, len(self.ids) + 1))
+
+
+# A row: (puzzle, answer, hard, player, variant, result, guesses, colors, consistent)
+
+TWEET = re.compile(r"Wordle\s+#?(\d[\d,.]*)\s+([1-6Xx])/6(\*?)")
+
+
+def parse_share(text):
+	"""(puzzle, result, hard, colour rows) from a shared Wordle result, or None."""
+	m = TWEET.search(text)
+	if not m:
+		return None
+	puzzle = int(re.sub(r"[,.]", "", m.group(1)))
+	n = m.group(2)
+	result = 0 if n in "Xx" else int(n)
+	rows = []
+	chat = 0  # lines of text between the header and the grid
+	for line in text[m.end():].splitlines():
+		line = line.replace("\ufe0f", "").strip()
+		if len(line) >= 5 and all(c in SQUARE for c in line[:5]) and line[5:6] not in SQUARE:
+			rows.append("".join(SQUARE[c] for c in line[:5]))
+			if line[5:].strip():
+				break  # text after the last row
+		elif rows:
+			break
+		elif line:
+			chat += 1
+			if chat > 3:
+				break
+	return puzzle, result, int(bool(m.group(3))), rows
+
+
+def good_grid(result, rows):
+	if result:
+		return len(rows) == result and rows[-1] == "ggggg" and "ggggg" not in rows[:-1]
+	return len(rows) == 6 and "ggggg" not in rows
+
+
+def tweets(lists, path, id_col, puzzle_col, user_col, text_col):
+	players = Players()
+	seen = set()
+	bad = 0
+	for r in zip_csv(path):
+		tid = r.get(id_col)
+		if tid in seen:
+			continue
+		seen.add(tid)
+		text = r.get(text_col) or ""
+		if text.startswith("RT @"):
+			continue  # someone else's game
+		p = parse_share(text)
+		# A puzzle far from the day it was collected for is another game's share text.
+		if not p or not good_grid(p[1], p[3]) or abs(p[0] - int(r[puzzle_col])) > 7:
+			bad += 1
+			continue
+		puzzle, result, hard, rows = p
+		answer = lists.answer(puzzle)
+		yield (puzzle, answer, hard, players(r.get(user_col)), None, result, None, " ".join(rows),
+			lists.check_colors(answer, rows))
+	log(f"  skipped {bad} tweets without a readable Wordle grid")
+
+
+def import_tweets_calvet(lists, dl):
+	path = kaggle("scarcalvetsis/wordle-games", dl)
+	players = Players()
+	bad = 0
+	for r in zip_csv(path):
+		rows = ["".join(SQUARE.get(c, "?") for c in s.replace("\ufe0f", ""))
+			for s in re.findall(r"'([^']*)'", r["processed_text"])]
+		trial = int(r["Trial"])
+		result = trial if trial <= 6 else 0
+		if not good_grid(result, rows):
+			bad += 1
+			continue
+		puzzle = int(r["Game"])
+		answer = (r["target"] or "").strip().lower() or lists.answer(puzzle)
+		yield (puzzle, answer, None, players(r["Username"]), None, result, None, " ".join(rows),
+			lists.check_colors(answer, rows))
+	log(f"  skipped {bad} malformed games")
+
+
+def import_tweets_hamner(lists, dl):
+	yield from tweets(lists, kaggle("benhamner/wordle-tweets", dl), "tweet_id", "wordle_id", "tweet_username",
+		"tweet_text")
+
+
+def import_tweets_vora(lists, dl):
+	yield from tweets(lists, kaggle("vora1011/wordletweets", dl), "ID", "WordleID", "UserID", "Text")
+
+
+def import_sim_hohmann(lists, dl):
+	path = kaggle("lucashohmann/wordle-random-simulations", dl)
+	hit = {"c": "g", "m": "y", "_": "b"}
+	for r in zip_csv(path):
+		answer = r["solution"].strip()
+		guesses, colors = [], []
+		for i in range(6):
+			g = (r.get(f"attempt_{i}") or "").strip()
+			if not g:
+				break
+			guesses.append(g)
+			colors.append("".join(hit.get(c, "?") for c in r[f"hits_{i}"].strip()))
+		if not guesses:
+			continue
+		result = len(guesses) if guesses[-1] == answer else 0
+		yield (None, answer, None, None, None, result, " ".join(guesses), " ".join(colors),
+			lists.check_words(answer, guesses, colors))
+
+
+def import_lmrl_gym(lists, dl):
+	base = "https://rail.eecs.berkeley.edu/datasets/rl-llm-bench-dataset/wordle/"
+	vocab = fetch("https://raw.githubusercontent.com/abdulhaim/LMRL-Gym/main/llm_rl_scripts/wordle/vocab/"
+		"wordle_official_400.txt", os.path.join(dl, "lmrl-gym", "wordle_official_400.txt"))
+	with open(vocab) as f:
+		pool = [w.strip() for w in f if valid_word(w.strip())]
+	# LMRL-Gym's own colours: unlike the game, every extra copy of a letter in the answer shows
+	# yellow. Inferring a failed game's answer has to use them; the consistency check uses the game's.
+	def lmrl_feedback(g, a):
+		return "".join("g" if g[i] == a[i] else "y" if g[i] in a else "b" for i in range(5))
+	groups = {}  # guess -> colours -> the pool words giving them
+
+	def fits(g, c):
+		if g not in groups:
+			groups[g] = collections.defaultdict(set)
+			for w in pool:
+				groups[g][lmrl_feedback(g, w)].add(w)
+		return groups[g].get(c, set())
+	for split in ("train", "eval"):
+		path = fetch(base + f"{split}_data.jsonl", os.path.join(dl, "lmrl-gym", f"{split}_data.jsonl"))
+		with open(path) as f:
+			for line in f:
+				seq = json.loads(line)["sequence"]
+				guesses, colors = [], []
+				for i, (text, weight) in enumerate(seq):
+					if weight == 1.0 and i + 1 < len(seq):
+						guesses.append(text.replace(" ", "").strip())
+						colors.append(seq[i + 1][0].replace(" ", "").strip())
+				if not guesses:
+					continue
+				solved = colors[-1] == "ggggg"
+				answer = guesses[-1] if solved else None
+				if not answer:
+					left = set.intersection(*(fits(g, c) for g, c in zip(guesses, colors)))
+					answer = next(iter(left)) if len(left) == 1 else None
+				result = len(guesses) if solved else 0 if len(guesses) >= 6 else None
+				yield (None, answer, 0, None, split, result, " ".join(guesses), " ".join(colors),
+					lists.check_words(answer, guesses, colors))
+
+
+GUESS = re.compile(r"guess:\s*([A-Za-z]+)")
+KTO_COLOR = {"green": "g", "yellow": "y", "red": "b"}
+
+
+def kto_rows(dl):
+	"""KTO_FINAL's rows: from its parquet file if pyarrow is installed, else through
+	Hugging Face's rows API (slow: it rate-limits)."""
+	try:
+		import pyarrow.parquet as pq
+	except ImportError:
+		pq = None
+	if pq:
+		path = fetch("https://huggingface.co/datasets/clembench-playpen/KTO_FINAL/resolve/main/data/"
+			"train-00000-of-00001.parquet", os.path.join(dl, "clembench-kto", "train.parquet"))
+		yield from pq.read_table(path).to_pylist()
+		return
+	path = os.path.join(dl, "clembench-kto", "rows.jsonl")
+	if not os.path.exists(path):
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		api = "https://datasets-server.huggingface.co/rows?dataset=clembench-playpen/KTO_FINAL&config=default&split=train"
+		log(f"  downloading {api} (install pyarrow to read the parquet file instead)")
+		with open(path + ".part", "w") as f:
+			offset, total = 0, None
+			while total is None or offset < total:
+				page = get_json(f"{api}&offset={offset}&length=100", tries=8)
+				total = page["num_rows_total"]
+				for r in page["rows"]:
+					f.write(json.dumps(r["row"]) + "\n")
+				offset += 100
+				time.sleep(0.5)
+		os.replace(path + ".part", path)
+	with open(path) as f:
+		for line in f:
+			yield json.loads(line)
+
+
+def import_clembench_kto(lists, dl):
+	# Each row is one turn: the transcript so far and the next reply. Keep the longest per episode.
+	episodes = {}
+	for r in kto_rows(dl):
+		if not r["game"].startswith("wordle"):
+			continue
+		key = (r["game"], r["model"], r["benchmark_version"], r["experiment"], r["episode"], r["game_id"])
+		if key not in episodes or len(r["prompt"]) > len(episodes[key]["prompt"]):
+			episodes[key] = r
+	for (game, model, version, experiment, _, _), r in sorted(episodes.items()):
+		answer = r["target"].strip().lower()
+		msgs = r["prompt"] + r["completion"]
+		critic = "critic" in game
+		guesses, shown = [], []
+		for i, m in enumerate(msgs):
+			g = GUESS.search(m["content"]) if m["role"] == "assistant" else None
+			if not g:
+				continue
+			word = g.group(1).lower()
+			nxt = msgs[i + 1]["content"] if i + 1 < len(msgs) else None
+			if nxt is not None and "guess_feedback" in nxt:
+				guesses.append(word)
+				shown.append("".join(KTO_COLOR.get(c, "?") for c in re.findall(r"<(\w+)>", nxt)))
+			elif nxt is None and word in lists.allowed and (not critic or "guess_agreement" in msgs[i - 1]["content"]):
+				# The final reply: played, but its colours aren't in the record.
+				guesses.append(word)
+				shown.append(None)
+		if not guesses or len(guesses) > 6 or not all(g in lists.allowed for g in guesses):
+			continue
+		colors = [feedback(g, answer) for g in guesses]
+		consistent = int(all(s is None or s == c for s, c in zip(shown, colors)))
+		result = len(guesses) if guesses[-1] == answer else 0 if len(guesses) == 6 else None
+		yield (None, answer, 0, model, f"{game}/{experiment}", result, " ".join(guesses), " ".join(colors),
+			consistent)
+
+
+def daily_wordlebot(lists, dl, db, src, through, refresh):
+	have = set() if refresh else {d for (d,) in db.execute("SELECT DISTINCT date FROM daily WHERE source=?", (src,))}
+	days = [d for d, w in sorted(lists.by_date.items()) if d <= through and d.isoformat() not in have]
+	log(f"  fetching {len(days)} days through {through}")
+
+	cache = os.path.join(dl, "nyt-wordlebot")
+	os.makedirs(cache, exist_ok=True)
+
+	def one(day):
+		w = lists.by_date[day]
+		path = os.path.join(cache, f"{w}-{day.isoformat()}.json")
+		if os.path.exists(path):
+			with open(path) as f:
+				return day, w, json.load(f)
+		d = get_json(f"https://static01.nyt.com/newsgraphics/2022/wordlebot/{w}-{day.isoformat()}/summary.json")
+		if d is not None:
+			with open(path + ".part", "w") as f:
+				json.dump(d, f)
+			os.replace(path + ".part", path)
+		return day, w, d
+
+	rows, missing = [], 0
+	with ThreadPoolExecutor(max_workers=4) as pool:
+		for i, (day, w, d) in enumerate(pool.map(one, days), 1):
+			if i % 200 == 0:
+				log(f"    {i}/{len(days)}")
+			if not isinstance(d, dict) or not isinstance(d.get("steps"), dict):
+				missing += 1
+				continue
+			for mode, steps in d["steps"].items():
+				if not isinstance(steps, list) or not all(isinstance(x, (int, float)) for x in steps):
+					continue
+				n = (list(steps) + [0] * 7)[:7]
+				extra = {k: v.get(mode) if isinstance(v, dict) else v for k, v in d.items() if k != "steps"}
+				extra["guesses"] = {k: v for k, v in (d.get("guesses") or {}).items() if k.startswith(mode)}
+				avg = d.get("average")
+				rows.append((src, day.isoformat(), (day - FIRST).days, w, mode, sum(steps), None, *n, 0,
+					avg.get(mode) if isinstance(avg, dict) else None, json.dumps(extra)))
+	if missing:
+		log(f"  no summary for {missing} days")
+	return rows
+
+
+def daily_mcm(lists, dl, db, src, through, refresh):
+	path = fetch("https://raw.githubusercontent.com/arusli1/MCM-Wordle-Prediction/main/data/2023_MCM_Problem_C_Data.csv",
+		os.path.join(dl, "mcm-2023", "2023_MCM_Problem_C_Data.csv"))
+	rows = []
+	with open(path, newline="", encoding="utf-8") as f:
+		for r in csv.reader(f):
+			if not r or not r[0][:1].isdigit():
+				continue
+			day = dt.date.fromisoformat(r[0])
+			answer = lists.by_date.get(day)
+			extra = {"word_as_given": r[2].strip()} if r[2].strip().lower() != answer else {}
+			pct = [float(x) for x in r[5:12]]
+			avg = sum((i + 1) * p for i, p in enumerate(pct)) / (sum(pct) or 1)
+			rows.append((src, day.isoformat(), int(r[1]), answer, "all", int(r[3]), int(r[4]), *pct, 1, avg,
+				json.dumps(extra) if extra else None))
+	return rows
+
+
+GAME_IMPORTS = {
+	"tweets-calvet": import_tweets_calvet,
+	"tweets-hamner": import_tweets_hamner,
+	"tweets-vora": import_tweets_vora,
+	"sim-hohmann": import_sim_hohmann,
+	"lmrl-gym": import_lmrl_gym,
+	"clembench-kto": import_clembench_kto,
+}
+DAILY_IMPORTS = {"nyt-wordlebot": daily_wordlebot, "mcm-2023": daily_mcm}
+
+
+def open_db(path):
+	os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+	db = sqlite3.connect(path)
+	db.executescript(SCHEMA)
+	db.execute("INSERT OR REPLACE INTO meta VALUES('schema', ?)", (str(SCHEMA_VERSION),))
+	db.commit()
+	return db
+
+
+def source_id(db, name):
+	s = SOURCES[name]
+	db.execute("INSERT INTO sources(name, title, url, license, kind, notes) VALUES(?,?,?,?,?,?) "
+		"ON CONFLICT(name) DO UPDATE SET title=excluded.title, url=excluded.url, license=excluded.license, "
+		"kind=excluded.kind, notes=excluded.notes",
+		(name, s["title"], s["url"], s["license"], s["kind"], s["notes"]))
+	return db.execute("SELECT id FROM sources WHERE name=?", (name,)).fetchone()[0]
+
+
+def import_games(db, name, lists, dl):
+	src = source_id(db, name)
+	if db.execute("SELECT 1 FROM sqlite_master WHERE name='turn_eval'").fetchone():
+		db.execute("DELETE FROM turn_eval WHERE game IN (SELECT id FROM games WHERE source=?)", (src,))
+	db.execute("DELETE FROM games WHERE source=?", (src,))
+	n = 0
+	batch = []
+	insert = ("INSERT INTO games(source, puzzle, answer, hard, player, variant, result, guesses, colors, consistent) "
+		"VALUES(?,?,?,?,?,?,?,?,?,?)")
+	for row in GAME_IMPORTS[name](lists, dl):
+		batch.append((src, *row))
+		if len(batch) >= 50000:
+			db.executemany(insert, batch)
+			n += len(batch)
+			batch.clear()
+			if n % 500000 == 0:
+				log(f"    {n} games")
+	db.executemany(insert, batch)
+	n += len(batch)
+	return n
+
+
+def import_daily(db, name, lists, dl, through, refresh):
+	src = source_id(db, name)
+	rows = DAILY_IMPORTS[name](lists, dl, db, src, through, refresh)
+	if refresh:
+		db.execute("DELETE FROM daily WHERE source=?", (src,))
+	db.executemany("INSERT OR REPLACE INTO daily VALUES(" + ",".join("?" * 17) + ")", rows)
+	return len(rows)
+
+
+def main():
+	ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	ap.add_argument("sources", nargs="*", metavar="SOURCE",
+		help="sources to import (default all): " + ", ".join(SOURCES))
+	ap.add_argument("-l", "--list", action="store_true", help="list the sources and exit")
+	ap.add_argument("--db", default=DEFAULT_DB, help=f"database (default {DEFAULT_DB})")
+	ap.add_argument("--downloads", default=DEFAULT_DOWNLOADS,
+		help=f"where downloads are kept for re-imports (default {DEFAULT_DOWNLOADS})")
+	ap.add_argument("--through", type=dt.date.fromisoformat, default=dt.date.today() - dt.timedelta(days=1),
+		help="last day of daily statistics, YYYY-MM-DD (default yesterday)")
+	ap.add_argument("--refresh", action="store_true",
+		help="re-fetch every day of the daily statistics, not just the missing ones")
+	args = ap.parse_args()
+
+	if args.list:
+		for name, s in SOURCES.items():
+			print(f"{name:14} {s['kind']:9} {s['license']:22} {s['title']}\n{'':15}{s['url']}\n{'':15}{s['notes']}")
+		return 0
+	names = args.sources or list(SOURCES)
+	for n in names:
+		if n not in SOURCES:
+			ap.error(f"unknown source {n!r}; see --list")
+
+	lists = Lists()
+	db = open_db(args.db)
+	db.execute("PRAGMA synchronous=OFF")
+	failed = []
+	for name in names:
+		log(f"{name}: {SOURCES[name]['title']}")
+		t0 = time.time()
+		try:
+			if name in GAME_IMPORTS:
+				n = import_games(db, name, lists, args.downloads)
+				what = "games"
+			else:
+				n = import_daily(db, name, lists, args.downloads, min(args.through, dt.date.today()), args.refresh)
+				what = "daily rows"
+			db.execute("UPDATE sources SET imported=? WHERE name=?",
+				(dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"), name))
+			db.commit()
+			log(f"  {n} {what} in {time.time() - t0:.0f} s")
+		except Exception as e:
+			db.rollback()
+			log(f"  failed: {e}")
+			failed.append(name)
+	db.executescript(INDEXES)
+	db.execute("ANALYZE")
+	db.commit()
+	db.close()
+	log(f"database: {args.db}")
+	if failed:
+		log("failed: " + " ".join(failed))
+	return 1 if failed else 0
+
+
+if __name__ == "__main__":
+	sys.exit(main())

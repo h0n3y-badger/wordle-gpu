@@ -201,8 +201,7 @@ std::string default_cache_dir()
 	return {};
 }
 
-// One file per word lists, answer list and mode.
-static std::string opener_cache(const Engine & eng, bool hard, const std::string & dir)
+std::string opener_cache_path(const Engine & eng, bool hard, const std::string & dir)
 {
 	if (dir.empty()) return {};
 	uint64_t h = 14695981039346656037ull; // FNV-1a
@@ -310,7 +309,7 @@ bool Game::analyze(const Options & opt, Analysis & out, const Report & report,
 	}
 
 	// The opening is the same every game, so its exact results are kept on disk.
-	const std::string cache = turns_.empty() ? opener_cache(eng_, hard_, opt.cache_dir) : std::string();
+	const std::string cache = turns_.empty() ? opener_cache_path(eng_, hard_, opt.cache_dir) : std::string();
 	if (!cache.empty() && load_cache(cache, *this, out))
 	{
 		settle(out);

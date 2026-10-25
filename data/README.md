@@ -10,4 +10,7 @@ These files are data from other sources, not part of the Apache-2.0 licensed cod
 - `nyt-answers.txt`: past New York Times Wordle answers by date, fetched from
   `nytimes.com/svc/wordle/v2/<date>.json` with `tools/wordle-gpu-update-answers`.
 
+Played games and daily statistics are not here: `tools/wordle-gpu-import-games`
+downloads them from their publishers into a local database (see the main README).
+
 Wordle is a trademark of The New York Times Company; this project is not affiliated with it.

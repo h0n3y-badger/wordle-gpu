@@ -27,6 +27,11 @@ public:
 	explicit MainWindow(WordLists lists, QWidget * parent = nullptr);
 	~MainWindow() override;
 
+	// Replays a game from the games database: its colours on the board, a turn at a time.
+	Q_INVOKABLE void replayGame(long id);
+	// Picks a game from the database to replay.
+	Q_INVOKABLE void openGame();
+
 private:
 	Engine * engine();
 	void stopWorker();
@@ -38,6 +43,9 @@ private:
 	int selectedGuess() const;
 	void useWord(const QString & w);
 	QString validate(const QString & w) const;
+	void showReplayTurn(int turn);
+	void updateReplayInfo();
+	void endReplay();
 
 	WordLists lists_;
 	std::vector<int> pools_[3];  // indexed by Pool
@@ -58,6 +66,15 @@ private:
 	QLabel * breakdown_title_;
 	QLabel * status_;
 	QProgressBar * progress_;
+	QWidget * replay_bar_;
+	QLabel * replay_info_;
+	QPushButton * replay_prev_;
+	QPushButton * replay_next_;
+
+	// The game being replayed: its words and colours, and a one-line description.
+	QStringList replay_words_, replay_colors_;
+	QString replay_title_, replay_result_;
+	bool replaying_ = false;
 
 	std::thread worker_;
 	std::atomic<bool> cancel_{ false };

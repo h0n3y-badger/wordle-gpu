@@ -28,6 +28,8 @@ public:
 	void setEditWord(const QString & word);
 	Q_INVOKABLE void undo();
 	Q_INVOKABLE void reset();
+	// Replaces the committed rows without checking them (for replaying a saved game).
+	void setTurns(const QList<Row> & rows);
 
 	QSize sizeHint() const override;
 	QSize minimumSizeHint() const override { return sizeHint(); }

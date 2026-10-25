@@ -3,6 +3,9 @@
 #include "colors.h"
 #include "model.h"
 #include "exact.h"
+#ifdef WORDLE_GPU_GAMES
+#include "gamesdialog.h"
+#endif
 
 #include <QApplication>
 #include <QCheckBox>
@@ -41,7 +44,36 @@ MainWindow::MainWindow(WordLists lists, QWidget * parent) : QMainWindow(parent),
 	auto * reset = new QPushButton(tr("New game"));
 	buttons->addWidget(undo);
 	buttons->addWidget(reset);
+#ifdef WORDLE_GPU_GAMES
+	auto * saved = new QPushButton(tr("Saved games…"));
+	saved->setToolTip(tr("Replay a game from the games database (fill it with wordle-gpu-import-games)."));
+	buttons->addWidget(saved);
+	connect(saved, &QPushButton::clicked, this, &MainWindow::openGame);
+#endif
 	lv->addLayout(buttons);
+
+	// Replaying a saved game: where we are, and buttons to step through it (above the suggestions).
+	replay_bar_ = new QWidget;
+	auto * rv = new QHBoxLayout(replay_bar_);
+	rv->setContentsMargins(0, 0, 0, 6);
+	replay_info_ = new QLabel;
+	replay_info_->setWordWrap(true);
+	replay_info_->setTextFormat(Qt::RichText);
+	auto * rb = new QVBoxLayout;
+	replay_prev_ = new QPushButton(tr("◀ Previous guess"));
+	replay_next_ = new QPushButton(tr("Next guess ▶"));
+	auto * replay_close = new QPushButton(tr("Close game"));
+	rb->addWidget(replay_prev_);
+	rb->addWidget(replay_next_);
+	rb->addWidget(replay_close);
+	rv->addWidget(replay_info_, 1);
+	rv->addLayout(rb);
+	replay_bar_->hide();
+	connect(replay_prev_, &QPushButton::clicked, this, [this] { showReplayTurn(board_->turns().size() - 1); });
+	connect(replay_next_, &QPushButton::clicked, this, [this] { showReplayTurn(board_->turns().size() + 1); });
+	connect(replay_close, &QPushButton::clicked, this, &MainWindow::endReplay);
+	replay_prev_->setObjectName("replay_prev");
+	replay_next_->setObjectName("replay_next");
 	hard_ = new QCheckBox(tr("Hard mode"));
 	lv->addWidget(hard_);
 	pool_ = new QComboBox;
@@ -70,6 +102,7 @@ MainWindow::MainWindow(WordLists lists, QWidget * parent) : QMainWindow(parent),
 	big.setPointSizeF(big.pointSizeF() * 1.25);
 	summary_->setFont(big);
 	summary_->setTextFormat(Qt::RichText);
+	tv->addWidget(replay_bar_);
 	tv->addWidget(summary_);
 	auto * filters = new QHBoxLayout;
 	auto * search = new QLineEdit;
@@ -211,6 +244,153 @@ QString MainWindow::validate(const QString & w) const
 		if (!r.allows(s.data())) return tr("Hard mode: \"%1\" doesn't reuse every revealed letter.").arg(w.toUpper());
 	}
 	return {};
+}
+
+void MainWindow::openGame()
+{
+#ifdef WORDLE_GPU_GAMES
+	try
+	{
+		GamesDialog d(this);
+		if (d.exec() != QDialog::Accepted) return;
+		const StoredGame g = d.selected();
+		if (g.id) replayGame(g.id);
+	}
+	catch (const std::exception & e)
+	{
+		QMessageBox::warning(this, windowTitle(), QString::fromStdString(e.what()));
+	}
+#endif
+}
+
+void MainWindow::replayGame(long id)
+{
+#ifdef WORDLE_GPU_GAMES
+	std::optional<StoredGame> g;
+	try
+	{
+		g = GamesDb().game(id);
+	}
+	catch (const std::exception & e)
+	{
+		QMessageBox::warning(this, windowTitle(), QString::fromStdString(e.what()));
+		return;
+	}
+	if (!g || g->guesses.empty())
+	{
+		statusBar()->showMessage(tr("Game %1 isn't in the database, or has no words to replay.").arg(id), 4000);
+		return;
+	}
+	replay_words_.clear();
+	replay_colors_.clear();
+	for (size_t i = 0; i < g->guesses.size() && i < g->colors.size(); i++)
+	{
+		replay_words_ << QString::fromStdString(g->guesses[i]);
+		replay_colors_ << QString::fromStdString(g->colors[i]);
+	}
+	replay_title_ = tr("Game %1 from %2").arg(g->id).arg(QString::fromStdString(g->source));
+	if (g->puzzle >= 0) replay_title_ += tr(", Wordle %1").arg(g->puzzle);
+	if (!g->player.empty()) replay_title_ += QStringLiteral(", ") + QString::fromStdString(g->player);
+	replay_result_ = (g->answer.empty() ? tr("answer unknown") : tr("answer %1").arg(QString::fromStdString(g->answer).toUpper()))
+		+ ", " + (g->result > 0 ? tr("solved in %1").arg(g->result) : g->result == 0 ? tr("failed") : tr("unfinished"));
+	if (g->consistent == 0) replay_result_ += tr("; its colours aren't the real game's");
+
+	// The game's mode, and an answer list that has its answer.
+	const QSignalBlocker b1(hard_), b2(pool_);
+	hard_->setChecked(g->hard == 1);
+	if (!g->answer.empty())
+	{
+		auto it = std::lower_bound(lists_.allowed.begin(), lists_.allowed.end(), g->answer);
+		const int w = it != lists_.allowed.end() && *it == g->answer ? (int)(it - lists_.allowed.begin()) : -1;
+		const auto & nyt = pools_[(int)Pool::NYT];
+		if (pool_->currentIndex() == (int)Pool::ORIGINAL || !std::binary_search(nyt.begin(), nyt.end(), w))
+			pool_->setCurrentIndex(std::binary_search(nyt.begin(), nyt.end(), w) ? (int)Pool::NYT : (int)Pool::ALL);
+	}
+	replaying_ = true;
+	replay_bar_->show();
+	showReplayTurn(0);
+#else
+	Q_UNUSED(id);
+#endif
+}
+
+void MainWindow::showReplayTurn(int turn)
+{
+	if (!replaying_) return;
+	turn = std::clamp(turn, 0, (int)replay_words_.size());
+	QList<Board::Row> rows;
+	for (int i = 0; i < turn; i++)
+	{
+		Board::Row r;
+		r.word = replay_words_[i];
+		const auto pat = parse_pattern(replay_colors_[i].toStdString());
+		for (int k = 0; k < 5; k++) r.digit[k] = pat ? pat_digit(*pat, k) : 0;
+		rows << r;
+	}
+	board_->setTurns(rows); // analyses the new position
+	if (turn < replay_words_.size()) board_->setEditWord(replay_words_[turn]);
+	replay_prev_->setEnabled(turn > 0);
+	replay_next_->setEnabled(turn < replay_words_.size());
+	updateReplayInfo();
+	board_->setFocus();
+}
+
+void MainWindow::endReplay()
+{
+	replaying_ = false;
+	replay_bar_->hide();
+	board_->setEditWord(QString());
+}
+
+// Where the replay is, and how the guess played next ranks among the suggestions.
+void MainWindow::updateReplayInfo()
+{
+	if (!replaying_) return;
+	const QList<Board::Row> turns = board_->turns();
+	bool same = turns.size() <= replay_words_.size();
+	for (int i = 0; same && i < turns.size(); i++)
+		same = turns[i].word == replay_words_[i] && pattern_string((uint8_t)turns[i].pattern()) == replay_colors_[i].toStdString();
+	if (!same)
+	{
+		endReplay(); // the board was edited
+		return;
+	}
+	const int k = (int)turns.size();
+	QString text = QStringLiteral("<b>%1</b><br>%2.<br>").arg(replay_title_.toHtmlEscaped(), replay_result_.toHtmlEscaped());
+	if (k >= replay_words_.size())
+	{
+		replay_info_->setText(text + tr("End of the game."));
+		return;
+	}
+	const QString played = replay_words_[k].toUpper();
+	text += tr("Guess %1: <b>%2</b>").arg(k + 1).arg(played);
+	if (shown_ && shown_eng_ && !shown_->rows.empty() && (int)shown_->played == k)
+	{
+		const auto & a = *shown_;
+		auto score = [&](const Suggestion & s) {
+			if (s.exact >= INF) return tr("can't win in time");
+			if (s.exact >= 0) return tr("average score %1").arg(a.expected_exact(s), 0, 'f', 4);
+			return a.have_lookahead ? tr("average score ≥ %1").arg(a.expected_lb(s), 0, 'f', 4) : QString();
+		};
+		const std::string w = replay_words_[k].toStdString();
+		int rank = -1;
+		for (size_t i = 0; i < a.rows.size(); i++)
+			if (shown_eng_->words()[a.rows[i].guess] == w) rank = (int)i;
+		if (rank < 0)
+			text += tr(" (not allowed here in hard mode)");
+		else
+		{
+			const Suggestion & best = a.rows[0];
+			text += tr(", ranked %1 of %2, %3").arg(rank + 1).arg(a.rows.size()).arg(score(a.rows[rank]));
+			if (best.exact >= INF)
+				text += tr(" (no guess can)");
+			else if (rank > 0)
+				text += tr("; best %1, %2").arg(QString::fromStdString(shown_eng_->words()[best.guess]).toUpper()).arg(score(best));
+			if (rank > 0 && a.rows[rank].exact >= 0 && a.rows[rank].exact < INF && best.exact >= 0)
+				text += tr(" (%1 guesses lost)").arg(a.expected_exact(a.rows[rank]) - a.expected_exact(best), 0, 'f', 4);
+		}
+	}
+	replay_info_->setText(text + '.');
 }
 
 void MainWindow::useWord(const QString & w)
@@ -357,13 +537,16 @@ void MainWindow::showAnalysis(std::shared_ptr<const Analysis> a, Game::Stage sta
 	{
 		const Suggestion & best = a->rows[0];
 		text = tr("%1 possible answers. Best next guess: <b>%2</b>").arg(n).arg(word(best.guess));
-		if (best.exact >= 0 && best.exact < INF)
+		if (best.exact >= INF)
+			text = tr("%1 possible answers, and no guess can win in time.").arg(n);
+		else if (best.exact >= 0)
 			text += tr(" — average score %1").arg(a->expected_exact(best), 0, 'f', 4);
 		else if (best.la.by3 >= 0)
 			text += tr(" — average score ≥ %1").arg(a->expected_lb(best), 0, 'f', 4);
 		if (a->proven) text += tr(" <span style='color:%1'>★ proven optimal</span>").arg(colors::GREEN.name());
 	}
 	summary_->setText(text);
+	updateReplayInfo();
 
 	if (stage == Game::LOOKAHEAD) look_secs_ = secs;
 	if (a->rows.empty())

@@ -53,7 +53,8 @@ and falls back to plain code otherwise. The GPU code needs an NVIDIA card; set
 ## Build
 
 Needs CUDA (nvcc, sm_120 by default), CMake, Ninja or Make, and Qt 6 Widgets
-for the GUI (without Qt 6, only the CLI is built).
+for the GUI (without Qt 6, only the CLI is built). SQLite 3 adds the played-games
+database (`wordle-gpu-games` and the GUI's **Saved games…**).
 
     cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc
     ninja -C build
@@ -79,6 +80,9 @@ would split them.
   word", for when the answer may be outside the original list.
 - **Solve exactly** runs the exact search until the best guess is proven
   optimal; **Stop** cancels it.
+- **Saved games…** replays a game from the games database (see below) a guess at a
+  time: each step shows the position before the guess that was played, and where
+  that guess ranks against the best.
 
 GPU work is cut into launches of about 25 ms so the desktop stays smooth.
 
@@ -134,6 +138,44 @@ answer pool is therefore the original list plus every NYT answer so far (2,386 w
 `~/.local/share/wordle-gpu/nyt-answers.txt`, which both programs read at startup. It
 fetches only dates it doesn't have yet, and never later than yesterday unless you pass
 `--through`, so it can't spoil today's puzzle. `-w` / `-A` load other lists.
+
+## Played games
+
+`wordle-gpu-import-games` downloads published Wordle games and daily statistics into
+`~/.local/share/wordle-gpu/games.sqlite` (about 1.4 GB, plus 0.7 GB of downloads kept in
+`~/.cache/wordle-gpu/downloads` for re-imports). Nothing of it is in this repository:
+several sources are copyrighted or have no stated licence, so keep the database on your
+own machine. `wordle-gpu-import-games -l` lists the sources; name some to import just those.
+
+| Source | What | Games |
+|---|---|---|
+| `tweets-calvet` | Results shared on Twitter, Jan–Nov 2022 (Kaggle, CC BY-SA 4.0) | 6.9 M, colours only |
+| `tweets-hamner` | Shared results, Wordle 210–519 (Kaggle) | 1.2 M, colours only, solved games only |
+| `tweets-vora` | Shared results, Wordle 252–399 (Kaggle, CC0) | 2.0 M, colours only |
+| `sim-hohmann` | Random play from the original answers (Kaggle, CC0) | 3.3 M with words |
+| `lmrl-gym` | Scripted games from LMRL-Gym (Berkeley) | 1.1 M with words |
+| `clembench-kto` | LLM players from clembench (Hugging Face) | 1,210 with words |
+| `nyt-wordlebot` | WordleBot's daily guess counts, normal and hard mode, every day so far | daily |
+| `mcm-2023` | The MCM 2023 contest's daily table for 2022 (percentages) | daily |
+
+Tweets keep no names or text: each player gets an anonymous number per source. Every
+game records whether its colours could be real for its answer. LMRL-Gym and clembench
+colour repeated letters their own way (LMRL-Gym shows every extra copy yellow), so 34% and
+10% of their games aren't positions the real game reaches; they are kept but marked, and
+skipped when scoring.
+
+    wordle-gpu-games                       # the sources
+    wordle-gpu-games stats                 # solved, average and guess spread per source
+    wordle-gpu-games day 2026-10-20        # one puzzle: WordleBot, MCM and shared results
+    wordle-gpu-games -s lmrl-gym -R list   # random games (-w answer, -p puzzle, -W words, -c real colours)
+    wordle-gpu-games -x show 13618400      # a game with each guess scored against the best
+    wordle-gpu-games -n 500 analyze        # score 500 games per source, then a summary
+
+Scoring replays the game: at each position it proves the best guess and solves the
+played one exactly, and reports how many guesses the played one costs on average
+compared with perfect play (`-q` uses the GPU's two-ply bounds instead). That takes about
+half a second a game; results are kept in the database (`turn_eval`), so `show` and
+later `analyze` runs reuse them.
 
 ## Checks
 

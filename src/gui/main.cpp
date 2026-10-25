@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialog>
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QPushButton>
@@ -15,7 +16,8 @@
 // space-separated steps, each typed letters/digits (sent to the board as key presses),
 // "ret", "bs", "wait" (until the analysis is done), "sleep:MS", "exact", "stop", "undo",
 // "hard", "pool", "row:N",
-// "tab:N", "shot:FILE" or "quit".
+// "tab:N", "replay:GAME_ID", "next", "prev", "games" (the saved-games dialog), "dlg:random",
+// "dlg:open", "dlg:shot:FILE", "shot:FILE" or "quit".
 static void run_test(MainWindow * w, QStringList list)
 {
 	auto steps = std::make_shared<QStringList>(list);
@@ -48,6 +50,18 @@ static void run_test(MainWindow * w, QStringList list)
 			t->setCurrentIndex(t->model()->index(s.mid(4).toInt(), 1));
 		}
 		else if (s.startsWith("tab:")) w->findChild<QTabWidget *>("tabs")->setCurrentIndex(s.mid(4).toInt());
+		else if (s.startsWith("replay:")) w->replayGame(s.mid(7).toLong());
+		else if (s == "next") w->findChild<QPushButton *>("replay_next")->click();
+		else if (s == "prev") w->findChild<QPushButton *>("replay_prev")->click();
+		else if (s == "games") QMetaObject::invokeMethod(w, "openGame", Qt::QueuedConnection);
+		else if (s.startsWith("dlg:"))
+		{
+			auto * d = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			if (!d) { steps->prepend(s); delay = 50; } // not open yet
+			else if (s == "dlg:random") d->findChild<QPushButton *>("random")->click();
+			else if (s == "dlg:open") d->accept();
+			else if (s.startsWith("dlg:shot:")) d->grab().save(s.mid(9));
+		}
 		else if (s.startsWith("shot:")) w->grab().save(s.mid(5));
 		else if (s == "quit") { QApplication::quit(); return; }
 		else

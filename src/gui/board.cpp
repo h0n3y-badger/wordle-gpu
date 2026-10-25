@@ -42,6 +42,15 @@ void Board::reset()
 	emit turnsChanged();
 }
 
+void Board::setTurns(const QList<Row> & rows)
+{
+	rows_ = rows.mid(0, 6);
+	committed_ = (int)rows_.size();
+	if (committed_ < 6 && !solved()) rows_.push_back(Row());
+	update();
+	emit turnsChanged();
+}
+
 void Board::undo()
 {
 	if (committed_ == 0) return;
