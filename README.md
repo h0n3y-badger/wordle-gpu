@@ -125,3 +125,9 @@ fetches only dates it doesn't have yet, and never later than yesterday unless yo
 The stats, two-ply values (normal and hard mode) and exact values were checked
 against an independent Python brute force on several positions, with no
 differences.
+
+## License
+
+Apache License 2.0, see `LICENSE`. The word lists in `data/` come from other
+sources; see `data/README.md`. Wordle is a trademark of The New York Times Company;
+this project is not affiliated with it.
